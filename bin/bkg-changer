@@ -1,0 +1,541 @@
+#!/bin/bash
+
+# bkg-changer — worker for the Omarchy "Background Changer" plugin.
+#
+# Fetches a JSON document from a configurable endpoint, downloads the image it
+# points at, applies it as the desktop background and keeps a small local pool
+# so rotation keeps working with no network.
+#
+# Usage: bkg-changer [run|next|status|interval]
+#
+#   run       fetch a fresh image and apply it; falls back to `next` on failure
+#   next      rotate to the next image already in the local pool (no network)
+#   status    print JSON describing config, pool and last run
+#   interval  print the configured interval in minutes
+#
+# Deliberately not `set -e`: every failure is handled and downgraded to the
+# offline rotation path, because a wallpaper that stops changing is the bug we
+# are trying to avoid.
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-bkg-changer"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+POOL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-bkg-changer/images"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-bkg-changer"
+LOG_FILE="$STATE_DIR/bkg-changer.log"
+LOCK_FILE="$STATE_DIR/lock"
+LAST_FILE="$STATE_DIR/last"
+NOTICE_IMAGE="$STATE_DIR/setup-required.png"
+
+OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+CURRENT_LINK="$OMARCHY_STATE/current/background"
+PAUSE_FLAG="$OMARCHY_STATE/toggles/bkg-changer-off"
+
+LOG_MAX_BYTES=262144
+LOG_KEEP_LINES=200
+
+# Same extension set Omarchy itself accepts for backgrounds.
+FIND_EXT=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
+  -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp')
+
+# ------------------------------------------------------------------ logging
+
+log() {
+  local line
+  printf -v line '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null
+  [[ -t 2 ]] && printf '%s\n' "$line" >&2
+  return 0
+}
+
+rotate_log() {
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null) || return 0
+  ((size > LOG_MAX_BYTES)) || return 0
+  local tmp="$LOG_FILE.tmp.$$"
+  tail -n "$LOG_KEEP_LINES" "$LOG_FILE" >"$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$LOG_FILE"
+  rm -f "$tmp"
+}
+
+record_result() {
+  printf '%s\t%s\n' "$(date +%s)" "$1" >"$LAST_FILE" 2>/dev/null
+  return 0
+}
+
+# ------------------------------------------------------------------- config
+
+write_default_config() {
+  cat >"$CONFIG_FILE" <<'EOF'
+# Omarchy Background Changer — configuration.
+# Edit freely; changes to BG_INTERVAL_MINUTES are picked up without a restart.
+
+# Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}.
+# Leave empty to rotate only the images already downloaded.
+BG_ENDPOINT=""
+
+# How often to change the background, in minutes.
+BG_INTERVAL_MINUTES=60
+
+# How many downloaded images to keep locally for offline rotation.
+BG_KEEP_IMAGES=10
+
+# Per-request network timeout, in seconds.
+BG_TIMEOUT_SECONDS=20
+
+# Attempts per network call before giving up and rotating the local pool.
+BG_MAX_RETRIES=4
+
+# Exponential backoff base: waits BASE, BASE*2, BASE*4 ... between attempts.
+BG_RETRY_BASE_SECONDS=2
+EOF
+}
+
+CONFIG_KEYS=(BG_ENDPOINT BG_INTERVAL_MINUTES BG_KEEP_IMAGES
+  BG_TIMEOUT_SECONDS BG_MAX_RETRIES BG_RETRY_BASE_SECONDS)
+
+load_config() {
+  mkdir -p "$CONFIG_DIR" "$POOL_DIR" "$STATE_DIR" 2>/dev/null
+
+  # Anything already in the environment wins over the config file, which makes
+  # `BG_ENDPOINT=... bkg-changer run` usable for testing without editing config.
+  local key
+  declare -A env_override=()
+  for key in "${CONFIG_KEYS[@]}"; do
+    [[ -v $key ]] && env_override[$key]=${!key}
+  done
+
+  BG_ENDPOINT=""
+  BG_INTERVAL_MINUTES=60
+  BG_KEEP_IMAGES=10
+  BG_TIMEOUT_SECONDS=20
+  BG_MAX_RETRIES=4
+  BG_RETRY_BASE_SECONDS=2
+
+  if [[ ! -f $CONFIG_FILE ]]; then
+    write_default_config && log "created default config at $CONFIG_FILE"
+  fi
+
+  if [[ -f $CONFIG_FILE ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null || log "WARN could not parse $CONFIG_FILE, using defaults"
+    set +a
+  fi
+
+  for key in "${!env_override[@]}"; do
+    printf -v "$key" '%s' "${env_override[$key]}"
+  done
+
+  # A malformed number must not turn into an infinite loop or a zero interval.
+  is_positive_int "$BG_INTERVAL_MINUTES" || BG_INTERVAL_MINUTES=60
+  is_positive_int "$BG_KEEP_IMAGES" || BG_KEEP_IMAGES=10
+  is_positive_int "$BG_TIMEOUT_SECONDS" || BG_TIMEOUT_SECONDS=20
+  is_positive_int "$BG_MAX_RETRIES" || BG_MAX_RETRIES=4
+  is_positive_int "$BG_RETRY_BASE_SECONDS" || BG_RETRY_BASE_SECONDS=2
+}
+
+is_positive_int() {
+  [[ ${1:-} =~ ^[0-9]+$ ]] && ((${1} > 0))
+}
+
+# -------------------------------------------------------------------- pool
+
+pool_files_sorted() {
+  find "$POOL_DIR" -maxdepth 1 -type f \( "${FIND_EXT[@]}" \) -print0 2>/dev/null | sort -z
+}
+
+pool_files_by_mtime() {
+  find "$POOL_DIR" -maxdepth 1 -type f \( "${FIND_EXT[@]}" \) -printf '%T@\t%p\0' 2>/dev/null |
+    sort -z -rn | cut -z -f2-
+}
+
+pool_count() {
+  local -a files
+  mapfile -d '' -t files < <(pool_files_sorted)
+  printf '%s\n' "${#files[@]}"
+}
+
+current_background() {
+  readlink -f "$CURRENT_LINK" 2>/dev/null
+}
+
+bg_set_bin() {
+  if command -v omarchy-theme-bg-set >/dev/null 2>&1; then
+    printf 'omarchy-theme-bg-set\n'
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-theme-bg-set" \
+    "$HOME/.local/share/omarchy/bin/omarchy-theme-bg-set"; do
+    if [[ -x $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_background() {
+  local image=$1 setter output rc
+  if ! setter=$(bg_set_bin); then
+    log "ERROR omarchy-theme-bg-set not found; is Omarchy installed?"
+    return 1
+  fi
+  output=$("$setter" "$image" 2>&1)
+  rc=$?
+  if ((rc != 0)); then
+    log "ERROR failed to apply $(basename -- "$image"): ${output:-exit $rc}"
+    return 1
+  fi
+  log "applied $(basename -- "$image")"
+  return 0
+}
+
+# Rotate to the next pool image after the one currently in use, wrapping around.
+rotate_pool() {
+  local -a images
+  mapfile -d '' -t images < <(pool_files_sorted)
+  local total=${#images[@]}
+  if ((total == 0)); then
+    log "pool is empty, leaving the background untouched"
+    return 1
+  fi
+
+  local current index=-1 i
+  current=$(current_background)
+  for i in "${!images[@]}"; do
+    if [[ ${images[$i]} == "$current" ]]; then
+      index=$i
+      break
+    fi
+  done
+
+  local next=$(((index + 1) % total))
+  apply_background "${images[$next]}"
+}
+
+# ----------------------------------------------------------- setup notice
+#
+# With no endpoint configured and nothing downloaded yet there is nothing to
+# show, and a silent no-op looks like a broken plugin. Put the instructions on
+# the wallpaper itself. The notice lives outside the pool, so it is never
+# rotated into and never pruned.
+
+screen_geometry() {
+  local geometry
+  geometry=$(hyprctl -j monitors 2>/dev/null |
+    jq -r 'map(select(.width and .height)) | max_by(.width * .height)
+           | "\(.width)x\(.height)"' 2>/dev/null)
+  [[ $geometry =~ ^[0-9]+x[0-9]+$ ]] || geometry="1920x1080"
+  printf '%s\n' "$geometry"
+}
+
+# The generic sans-serif alias is whatever the system already considers its
+# readable sans, and fontconfig always resolves it — no font list to keep in
+# sync. Asking for the font *file* also sidesteps ImageMagick's own font-name
+# table, which is built at compile time and often does not list what is
+# installed. This is the same lookup omarchy-shell uses for its own UI font.
+resolve_font() {
+  command -v fc-match >/dev/null 2>&1 || return 1
+  local file
+  file=$(fc-match -f '%{file}' sans-serif 2>/dev/null)
+  [[ -n $file && -f $file ]] || return 1
+  printf '%s\n' "$file"
+}
+
+render_setup_notice() {
+  if ! command -v magick >/dev/null 2>&1; then
+    log "ERROR cannot draw the setup notice: imagemagick (magick) is missing"
+    return 1
+  fi
+
+  local geometry width height
+  geometry=$(screen_geometry)
+  width=${geometry%x*}
+  height=${geometry#*x}
+
+  # ~ keeps the path readable; the full path can be wider than the text column.
+  local body="No image endpoint is configured yet.
+
+Edit ${CONFIG_FILE/#$HOME/\~}
+and set BG_ENDPOINT to a URL returning
+
+{\"url\": \"https://example.com/image.jpg\"}
+
+Then run  omarchy-shell bkgchanger next
+to change the background right away."
+
+  local -a font=()
+  local file
+  file=$(resolve_font) && font=(-font "$file")
+
+  local column=$((width * 4 / 5))
+
+  magick -size "$geometry" canvas:black \
+    \( -background none -fill white -gravity center "${font[@]}" \
+    -size "${column}x" -pointsize "$((height / 32))" \
+    -interline-spacing "$((height / 60))" caption:"$body" \) \
+    -gravity center -composite "$NOTICE_IMAGE" 2>>"$LOG_FILE" || {
+    log "ERROR could not render the setup notice"
+    return 1
+  }
+  return 0
+}
+
+show_setup_notice() {
+  render_setup_notice || return 1
+  apply_background "$NOTICE_IMAGE"
+}
+
+# Keep the newest BG_KEEP_IMAGES files, never deleting the one on screen.
+prune_pool() {
+  local -a files
+  mapfile -d '' -t files < <(pool_files_by_mtime)
+  local current kept=0 file
+  current=$(current_background)
+
+  for file in "${files[@]}"; do
+    if ((kept < BG_KEEP_IMAGES)); then
+      ((kept++))
+      continue
+    fi
+    [[ $file == "$current" ]] && continue
+    rm -f -- "$file" && log "pruned $(basename -- "$file")"
+  done
+}
+
+# ----------------------------------------------------------------- network
+
+# curl with bounded exponential backoff. All arguments are passed through.
+curl_with_backoff() {
+  local attempt=1 rc delay reason
+  local errfile="$STATE_DIR/.curl-err.$$"
+  while :; do
+    # `&&` rather than `if`, so $? below is curl's status and not the `if`'s.
+    curl -fsSL --max-time "$BG_TIMEOUT_SECONDS" "$@" 2>"$errfile" && {
+      rm -f -- "$errfile"
+      return 0
+    }
+    rc=$?
+    reason=$(tail -n1 -- "$errfile" 2>/dev/null | tr -d '\r')
+    : "${reason:=curl exit $rc}"
+    if ((attempt >= BG_MAX_RETRIES)); then
+      log "WARN gave up after $attempt attempt(s): $reason"
+      rm -f -- "$errfile"
+      return "$rc"
+    fi
+    delay=$((BG_RETRY_BASE_SECONDS * (1 << (attempt - 1))))
+    ((delay > 60)) && delay=60
+    log "WARN $reason; retry $((attempt + 1))/$BG_MAX_RETRIES in ${delay}s"
+    # Jitter avoids every machine on a flaky network retrying in lockstep.
+    sleep "$delay.$((RANDOM % 100))"
+    ((attempt++))
+  done
+}
+
+resolve_image_url() {
+  local body url
+  body=$(curl_with_backoff -- "$BG_ENDPOINT") || return 1
+
+  url=$(printf '%s' "$body" | jq -er '.url' 2>/dev/null)
+  if [[ -z $url || $url == "null" ]]; then
+    log "ERROR endpoint response has no usable .url field"
+    return 1
+  fi
+  if [[ $url != http://* && $url != https://* ]]; then
+    log "ERROR refusing non-http(s) image url: $url"
+    return 1
+  fi
+
+  printf '%s\n' "$url"
+}
+
+extension_for_mime() {
+  case "$1" in
+    image/jpeg) printf 'jpg\n' ;;
+    image/png) printf 'png\n' ;;
+    image/webp) printf 'webp\n' ;;
+    image/gif) printf 'gif\n' ;;
+    image/bmp | image/x-ms-bmp) printf 'bmp\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Downloads $1, validates it really is an image, and prints the pool path.
+download_image() {
+  local url=$1
+  local tmp="$POOL_DIR/.download.$$"
+  rm -f -- "$tmp"
+
+  if ! curl_with_backoff -o "$tmp" -- "$url"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  if [[ ! -s $tmp ]]; then
+    log "ERROR downloaded file is empty: $url"
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  # An HTML error page served with a 200 must never become the wallpaper, so
+  # trust the content, not the URL or the Content-Type header.
+  local mime ext
+  mime=$(file --mime-type -b -- "$tmp" 2>/dev/null)
+  if ! ext=$(extension_for_mime "$mime"); then
+    log "ERROR downloaded content is not a supported image (mime: ${mime:-unknown})"
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  local sum target
+  sum=$(sha256sum -- "$tmp" | cut -c1-8)
+  target="$POOL_DIR/$sum.$ext"
+
+  if [[ -f $target ]]; then
+    # Already have this exact image; refresh its mtime so pruning treats it as
+    # recently seen instead of storing a byte-identical duplicate.
+    touch -- "$target"
+    rm -f -- "$tmp"
+    log "endpoint returned an image already in the pool ($sum.$ext)"
+  else
+    mv -f -- "$tmp" "$target" || {
+      log "ERROR could not store downloaded image"
+      rm -f -- "$tmp"
+      return 1
+    }
+    chmod 0644 -- "$target" 2>/dev/null
+    log "downloaded $sum.$ext"
+  fi
+
+  printf '%s\n' "$target"
+}
+
+# ------------------------------------------------------------- subcommands
+
+cmd_run() {
+  if [[ -e $PAUSE_FLAG ]]; then
+    log "paused ($PAUSE_FLAG exists), skipping"
+    record_result paused
+    return 0
+  fi
+
+  if [[ -z $BG_ENDPOINT ]]; then
+    log "BG_ENDPOINT is not set in $CONFIG_FILE, rotating the local pool only"
+    if rotate_pool; then
+      record_result rotated
+      return 0
+    fi
+    # Nothing configured and nothing cached: say so on the background itself.
+    if show_setup_notice; then
+      record_result unconfigured
+      return 0
+    fi
+    record_result failed
+    return 1
+  fi
+
+  local url image
+  if url=$(resolve_image_url) && image=$(download_image "$url") && apply_background "$image"; then
+    prune_pool
+    record_result fetched
+    return 0
+  fi
+
+  log "falling back to the local pool"
+  if rotate_pool; then
+    record_result rotated
+    return 0
+  fi
+
+  record_result failed
+  return 1
+}
+
+cmd_next() {
+  if rotate_pool; then
+    record_result rotated
+    return 0
+  fi
+  if [[ -z $BG_ENDPOINT ]] && show_setup_notice; then
+    record_result unconfigured
+    return 0
+  fi
+  record_result failed
+  return 1
+}
+
+cmd_status() {
+  local last_epoch="" last_result="unknown"
+  if [[ -f $LAST_FILE ]]; then
+    IFS=$'\t' read -r last_epoch last_result <"$LAST_FILE"
+  fi
+
+  jq -n \
+    --arg endpoint "$BG_ENDPOINT" \
+    --arg current "$(current_background)" \
+    --arg config "$CONFIG_FILE" \
+    --arg pool "$POOL_DIR" \
+    --arg lastResult "${last_result:-unknown}" \
+    --arg lastRun "${last_epoch:-}" \
+    --argjson interval "$BG_INTERVAL_MINUTES" \
+    --argjson keep "$BG_KEEP_IMAGES" \
+    --argjson stored "$(pool_count)" \
+    --argjson paused "$([[ -e $PAUSE_FLAG ]] && echo true || echo false)" \
+    '{
+      endpoint: $endpoint,
+      intervalMinutes: $interval,
+      keepImages: $keep,
+      storedImages: $stored,
+      currentBackground: $current,
+      paused: $paused,
+      lastResult: $lastResult,
+      lastRun: (if $lastRun == "" then null else ($lastRun | tonumber) end),
+      configFile: $config,
+      poolDir: $pool
+    }'
+}
+
+# ------------------------------------------------------------------- entry
+
+main() {
+  load_config
+  rotate_log
+
+  local command=${1:-run}
+  case "$command" in
+    interval)
+      printf '%s\n' "$BG_INTERVAL_MINUTES"
+      return 0
+      ;;
+    status)
+      cmd_status
+      return 0
+      ;;
+  esac
+
+  # Only the mutating commands need the lock: a timer tick and a manual IPC
+  # call must never race each other into the pool.
+  exec 9>"$LOCK_FILE" || {
+    log "ERROR cannot open lock file $LOCK_FILE"
+    return 1
+  }
+  if ! flock -n 9; then
+    log "another run is in progress, skipping"
+    return 0
+  fi
+
+  case "$command" in
+    run) cmd_run ;;
+    next | rotate) cmd_next ;;
+    *)
+      printf 'Usage: %s [run|next|status|interval]\n' "${0##*/}" >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
