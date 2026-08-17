@@ -7,6 +7,10 @@ import Quickshell.Io
 // Everything that can fail (network, disk, applying the wallpaper) lives in
 // bin/bkg-changer. This file only decides *when* to call it and how long to
 // wait after a failure.
+//
+// It is also the plugin's single backend. A bar widget is built once per
+// monitor, so the panel keeps no state of its own: it calls the functions
+// below and binds to `workerStatus`, and every copy of it agrees.
 Item {
   id: root
 
@@ -72,7 +76,53 @@ Item {
     onTriggered: configFile.reload()
   }
 
+  // ------------------------------------------------------------------ status
+  //
+  // The full picture — pool counts, ratings, what is on screen — is whatever
+  // `bkg-changer status` last said. Panels read this rather than shelling out
+  // themselves, so N monitors still means one process.
+  property var workerStatus: ({})
+
+  // Panels raise this while they are open; nothing polls when nobody is looking.
+  property int uiWatchers: 0
+  function watch() { root.uiWatchers++ }
+  function unwatch() { if (root.uiWatchers > 0) root.uiWatchers-- }
+
+  function refreshStatus() {
+    if (statusProc.running)
+      return
+    statusProc.command = [root.workerPath, "status"]
+    statusProc.running = true
+  }
+
+  Process {
+    id: statusProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw === "")
+          return
+        try {
+          root.workerStatus = JSON.parse(raw)
+        } catch (e) {
+          console.warn("bkg-changer: could not parse status: " + e)
+        }
+      }
+    }
+  }
+
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.uiWatchers > 0
+    triggeredOnStart: true
+    onTriggered: root.refreshStatus()
+  }
+
   // ------------------------------------------------------------------ worker
+
+  readonly property bool busy: worker.running
 
   function runWorker(command) {
     if (worker.running) {
@@ -84,9 +134,24 @@ Item {
     return true
   }
 
+  function like() { return runWorker("like") }
+  function dislike() { return runWorker("dislike") }
+  function rotate() { return runWorker("rotate") }
+
+  function runNow() {
+    retryTimer.stop()
+    var started = runWorker("run")
+    cycleTimer.restart()
+    root.lastTickMs = Date.now()
+    return started
+  }
+
   Process {
     id: worker
     onExited: function (exitCode) {
+      // Whatever the outcome, the pool and the wallpaper may have moved.
+      root.refreshStatus()
+
       if (exitCode === 0) {
         root.consecutiveFailures = 0
         root.lastResult = "ok"
@@ -108,7 +173,48 @@ Item {
     }
   }
 
+  // ------------------------------------------------------------------ config writes
+  //
+  // Separate from the worker above: editing a setting must not queue behind a
+  // download that can take a minute, and `set-config` never touches the pool
+  // so it does not take the worker's lock either.
+
+  signal configApplied(string key, bool ok)
+
+  property string pendingConfigKey: ""
+  readonly property bool savingConfig: configProc.running
+
+  function setConfig(key, value) {
+    if (configProc.running)
+      return false
+    root.pendingConfigKey = String(key)
+    configProc.command = [root.workerPath, "set-config", String(key), String(value)]
+    configProc.running = true
+    return true
+  }
+
+  Process {
+    id: configProc
+    onExited: function (exitCode) {
+      var key = root.pendingConfigKey
+      root.pendingConfigKey = ""
+      // The worker rewrites the file; re-read it now rather than waiting out
+      // the 30s poll, so the interval re-arms as soon as it is saved.
+      configFile.reload()
+      root.refreshStatus()
+      root.configApplied(key, exitCode === 0)
+      if (exitCode !== 0)
+        console.warn("bkg-changer: could not set " + key + " (exit " + exitCode + ")")
+    }
+  }
+
   // ------------------------------------------------------------------ timers
+
+  // A QML Timer does not expose its remaining time, so record when the clock
+  // last started and let readers work out the rest.
+  property double lastTickMs: 0
+  readonly property double nextRunMs: lastTickMs > 0
+    ? lastTickMs + Math.max(60000, root.intervalMinutes * 60000) : 0
 
   // triggeredOnStart is what makes the background change the moment the plugin
   // is installed and enabled — no user action, no waiting for the first hour.
@@ -118,7 +224,10 @@ Item {
     repeat: true
     running: true
     triggeredOnStart: true
-    onTriggered: root.runWorker("run")
+    onTriggered: {
+      root.lastTickMs = Date.now()
+      root.runWorker("run")
+    }
   }
 
   Timer {
@@ -134,28 +243,44 @@ Item {
 
     // Fetch a fresh image now and restart the clock from this moment.
     function next(): string {
-      retryTimer.stop()
-      var started = root.runWorker("run")
-      cycleTimer.restart()
-      return started ? "running" : "busy"
+      return root.runNow() ? "running" : "busy"
     }
 
-    // Rotate within the already-downloaded pool, no network.
+    // Rotate within the images already on disk, no network.
     function rotate(): string {
-      return root.runWorker("rotate") ? "running" : "busy"
+      return root.rotate() ? "running" : "busy"
+    }
+
+    // Keep the image on screen for good; it stops being prunable.
+    function like(): string {
+      return root.like() ? "running" : "busy"
+    }
+
+    // Remove the image on screen, never show it again, replace it now.
+    function dislike(): string {
+      return root.dislike() ? "running" : "busy"
     }
 
     function status(): string {
-      return JSON.stringify({
+      var merged = {
         intervalMinutes: root.intervalMinutes,
-        running: worker.running,
+        running: root.busy,
         lastResult: root.lastResult,
         consecutiveFailures: root.consecutiveFailures,
+        nextRun: root.nextRunMs > 0 ? Math.round(root.nextRunMs / 1000) : null,
         worker: root.workerPath,
         configFile: root.configPath
-      })
+      }
+      var extra = root.workerStatus || ({})
+      for (var key in extra)
+        if (!(key in merged))
+          merged[key] = extra[key]
+      return JSON.stringify(merged)
     }
   }
 
-  Component.onCompleted: console.log("bkg-changer: service loaded, worker=" + root.workerPath)
+  Component.onCompleted: {
+    console.log("bkg-changer: service loaded, worker=" + root.workerPath)
+    root.refreshStatus()
+  }
 }
