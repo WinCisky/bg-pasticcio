@@ -42,6 +42,18 @@ Panel {
   readonly property bool liked: status.currentLiked === true
   readonly property string endpoint: String(status.endpoint || "")
 
+  // Whatever the endpoint said about the picture, already whitelisted, capped
+  // and URL-checked by the worker. Rendered as plain text, never as markup.
+  readonly property var meta: status.currentMeta || ({})
+  readonly property string metaTitle: String(meta.title || "")
+  readonly property string metaCreator: String(meta.creator || "")
+  readonly property string metaLicense: String(meta.license || "")
+  readonly property string metaLicenseUrl: String(meta.licenseUrl || "")
+  readonly property string metaSource: String(meta.source || "")
+  readonly property string metaSourceUrl: String(meta.sourceUrl || "")
+  readonly property bool hasCredit: metaTitle !== "" || metaCreator !== ""
+    || metaLicense !== "" || metaSource !== ""
+
   property string endpointError: ""
   property bool endpointSaved: false
 
@@ -126,6 +138,21 @@ Panel {
     root.service.setConfig("BG_ENDPOINT", value)
   }
 
+  // bar.run hands its argument to `bash -lc`, so a URL from the network must
+  // never reach it unchecked. The worker already refuses anything outside this
+  // character set — note the absent apostrophe, which is what makes the single
+  // quotes below impossible to escape — and this repeats the check because a
+  // sidecar on disk can be edited by anything.
+  readonly property var safeUrlPattern: /^https?:\/\/[A-Za-z0-9._~:\/?#@!$&()*+,;=%-]+$/
+
+  function openUrl(url) {
+    var value = String(url || "")
+    if (!root.safeUrlPattern.test(value))
+      return
+    if (root.bar)
+      root.bar.run("xdg-open '" + value + "'")
+  }
+
   function setPaused(value) {
     if (!root.bar)
       return
@@ -199,6 +226,32 @@ Panel {
     onTriggered: root.endpointSaved = false
   }
 
+  // One line of the credit strip. Underlines and takes a click only when the
+  // endpoint actually gave a URL to go with the word.
+  component CreditText: Text {
+    id: credit
+
+    property string href: ""
+    readonly property bool linkable: credit.href !== ""
+
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    font.underline: credit.linkable && creditHover.hovered
+    elide: Text.ElideRight
+
+    HoverHandler {
+      id: creditHover
+      enabled: credit.linkable
+      cursorShape: Qt.PointingHandCursor
+    }
+
+    TapHandler {
+      enabled: credit.linkable
+      onTapped: root.openUrl(credit.href)
+    }
+  }
+
   // ------------------------------------------------------------------ bar icon
 
   BarIconButton {
@@ -208,7 +261,8 @@ Panel {
     text: "󰸉"
     active: root.failing
     dimmed: root.paused && !root.failing
-    tooltipText: root.headline + " · " + root.detailLine
+    tooltipText: (root.metaTitle !== "" ? root.metaTitle + " — " : "")
+                 + root.headline + " · " + root.detailLine
     onPressed: function (mouseButton) {
       if (!root.service) {
         root.toggle()
@@ -331,6 +385,61 @@ Panel {
                 color: "white"
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // -------------------------------------------------------- credit
+
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.hasCredit
+
+            Text {
+              width: parent.width
+              visible: root.metaTitle !== ""
+              text: root.metaTitle
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+              maximumLineCount: 2
+              elide: Text.ElideRight
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(5)
+              visible: root.metaCreator !== "" || root.metaLicense !== ""
+                       || root.metaSource !== ""
+
+              CreditText {
+                visible: root.metaCreator !== ""
+                text: "by " + root.metaCreator
+              }
+
+              CreditText {
+                visible: root.metaCreator !== ""
+                         && (root.metaLicense !== "" || root.metaSource !== "")
+                text: "·"
+              }
+
+              CreditText {
+                visible: root.metaLicense !== ""
+                text: root.metaLicense
+                href: root.metaLicenseUrl
+              }
+
+              CreditText {
+                visible: root.metaLicense !== "" && root.metaSource !== ""
+                text: "·"
+              }
+
+              CreditText {
+                visible: root.metaSource !== ""
+                text: root.metaSource
+                href: root.metaSourceUrl
               }
             }
           }

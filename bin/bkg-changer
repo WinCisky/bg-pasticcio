@@ -38,6 +38,10 @@ OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 CURRENT_LINK="$OMARCHY_STATE/current/background"
 PAUSE_FLAG="$OMARCHY_STATE/toggles/bkg-changer-off"
 
+# Works out of the box: a CC0 wallpaper feed that also sends title, creator and
+# licence. Blank it in config.env to rotate only what is already downloaded.
+DEFAULT_ENDPOINT="https://bkg.ssimo.dev"
+
 LOG_MAX_BYTES=262144
 LOG_KEEP_LINES=200
 
@@ -75,13 +79,19 @@ record_result() {
 # ------------------------------------------------------------------- config
 
 write_default_config() {
+  # Two parts, because the endpoint is written from $DEFAULT_ENDPOINT while the
+  # rest is a quoted heredoc: one place to change the default, and no risk of
+  # the shell expanding something in the comments.
   cat >"$CONFIG_FILE" <<'EOF'
 # Omarchy Background Changer — configuration.
 # Edit freely; changes to BG_INTERVAL_MINUTES are picked up without a restart.
 
-# Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}.
+# Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}, and
+# optionally a title, creator and licence for it.
 # Leave empty to rotate only the images already downloaded.
-BG_ENDPOINT=""
+EOF
+  printf 'BG_ENDPOINT="%s"\n' "$DEFAULT_ENDPOINT" >>"$CONFIG_FILE"
+  cat >>"$CONFIG_FILE" <<'EOF'
 
 # How often to change the background, in minutes.
 BG_INTERVAL_MINUTES=60
@@ -120,7 +130,7 @@ load_config() {
     [[ -v $key ]] && env_override[$key]=${!key}
   done
 
-  BG_ENDPOINT=""
+  BG_ENDPOINT="$DEFAULT_ENDPOINT"
   BG_INTERVAL_MINUTES=60
   BG_KEEP_IMAGES=10
   BG_TIMEOUT_SECONDS=20
@@ -436,7 +446,7 @@ prune_pool() {
       continue
     fi
     [[ $file == "$current" ]] && continue
-    rm -f -- "$file" "$file.src" && log "pruned $(basename -- "$file")"
+    rm -f -- "$file" "$file.src" "$file.meta" && log "pruned $(basename -- "$file")"
   done
 }
 
@@ -469,10 +479,71 @@ curl_with_backoff() {
   done
 }
 
-# Prints the image URL. Returns 2 when the endpoint named something already
-# disliked, so the caller can ask again instead of treating it as an outage.
-resolve_image_url() {
-  local body url
+# --------------------------------------------------------------- metadata
+#
+# An endpoint may say more about a picture than where to get it — a title, who
+# made it, what licence it carries. All of it is untrusted text that ends up on
+# screen, and two of the fields end up in a browser, so only a known set of
+# keys survives, strings are capped, and a URL has to be http(s) built from
+# characters that cannot break out of a single-quoted shell word. Dropping the
+# apostrophe from that set is what makes the quoting in the panel airtight.
+
+META_MAX_TEXT=200
+
+sanitize_meta() {
+  jq -c --argjson max "$META_MAX_TEXT" '
+    def clean_text:
+      if type == "string" and (. | length) > 0 then .[0:$max] else null end;
+    def clean_url:
+      if type == "string" and test("^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$")
+      then . else null end;
+    {
+      title:      (.title      | clean_text),
+      creator:    (.creator    | clean_text),
+      license:    (.license    | clean_text),
+      licenseUrl: (.licenseUrl | clean_url),
+      source:     (.source     | clean_text),
+      sourceUrl:  (.sourceUrl  | clean_url)
+    }
+    | with_entries(select(.value != null))
+  ' 2>/dev/null
+}
+
+write_meta() {
+  local target=$1 url=$2 meta=${3:-}
+  local merged
+  merged=$(printf '%s' "${meta:-\{\}}" |
+    jq -c --arg url "$url" '. + {url: $url}' 2>/dev/null)
+  [[ -n $merged ]] || merged=$(jq -cn --arg url "$url" '{url: $url}')
+  printf '%s\n' "$merged" >"$target.meta" 2>/dev/null
+  return 0
+}
+
+# Everything known about an image, as a JSON object. Falls back to the bare
+# `.src` sidecar, so an image downloaded before metadata existed still reports
+# where it came from.
+read_meta() {
+  local image=${1:-}
+  [[ -n $image ]] || { printf '{}\n'; return 0; }
+  if [[ -f $image.meta ]] && jq -e . "$image.meta" >/dev/null 2>&1; then
+    jq -c '.' "$image.meta"
+    return 0
+  fi
+  if [[ -f $image.src ]]; then
+    jq -cn --arg url "$(head -n1 -- "$image.src" 2>/dev/null)" '{url: $url}'
+    return 0
+  fi
+  printf '{}\n'
+}
+
+# Prints the sanitized endpoint answer as one JSON object, `.url` guaranteed.
+# Returns 2 when the endpoint named something already disliked, so the caller
+# can ask again instead of treating it as an outage.
+#
+# The whole object rather than just the URL because callers run this in a
+# command substitution, and a subshell cannot hand anything back any other way.
+resolve_endpoint_meta() {
+  local body url meta
   body=$(curl_with_backoff -- "$BG_ENDPOINT") || return 1
 
   url=$(printf '%s' "$body" | jq -er '.url' 2>/dev/null)
@@ -489,7 +560,10 @@ resolve_image_url() {
     return 2
   fi
 
-  printf '%s\n' "$url"
+  meta=$(printf '%s' "$body" | sanitize_meta)
+  [[ -n $meta ]] || meta="{}"
+
+  printf '%s' "$meta" | jq -c --arg url "$url" '. + {url: $url}'
 }
 
 extension_for_mime() {
@@ -504,9 +578,10 @@ extension_for_mime() {
 }
 
 # Downloads $1, validates it really is an image, and prints the pool path.
+# $2 is the endpoint's metadata for it, stored beside the file.
 # Returns 2 when the bytes turn out to be an image the user has disliked.
 download_image() {
-  local url=$1
+  local url=$1 meta=${2:-}
   local tmp="$POOL_DIR/.download.$$"
   rm -f -- "$tmp"
 
@@ -557,7 +632,7 @@ download_image() {
   if [[ -f $liked ]]; then
     touch -- "$liked"
     rm -f -- "$tmp"
-    [[ -f $liked.src ]] || printf '%s\n' "$url" >"$liked.src" 2>/dev/null
+    write_meta "$liked" "$url" "$meta"
     log "endpoint returned an image you had kept ($short.$ext)"
     printf '%s\n' "$liked"
     return 0
@@ -579,10 +654,10 @@ download_image() {
     log "downloaded $short.$ext"
   fi
 
-  # Remember where it came from, so a later dislike can block the URL too and
-  # save the download next time. Not an image extension, so the sidecar is
-  # invisible to every find in this file.
-  printf '%s\n' "$url" >"$target.src" 2>/dev/null
+  # Remember where it came from and whatever the endpoint said about it: a
+  # later dislike can block the URL too, and the panel has something to credit.
+  # Not an image extension, so the sidecar is invisible to every find here.
+  write_meta "$target" "$url" "$meta"
 
   printf '%s\n' "$target"
 }
@@ -591,9 +666,9 @@ download_image() {
 # Returns 2 when every attempt came back blocked — an endpoint that caches its
 # answer will do exactly that, and the caller should rotate instead.
 fetch_fresh_image() {
-  local attempt=1 url image rc blocked=0
+  local attempt=1 meta url image rc blocked=0
   while ((attempt <= BG_BLOCKED_RETRIES)); do
-    url=$(resolve_image_url)
+    meta=$(resolve_endpoint_meta)
     rc=$?
     if ((rc != 0)); then
       ((rc == 2)) || return 1
@@ -602,7 +677,13 @@ fetch_fresh_image() {
       continue
     fi
 
-    image=$(download_image "$url")
+    url=$(printf '%s' "$meta" | jq -r '.url // ""')
+    if [[ -z $url ]]; then
+      log "ERROR endpoint metadata lost its url"
+      return 1
+    fi
+
+    image=$(download_image "$url" "$meta")
     rc=$?
     if ((rc == 0)); then
       printf '%s\n' "$image"
@@ -714,6 +795,7 @@ cmd_like() {
     return 1
   fi
   [[ -f $current.src ]] && mv -f -- "$current.src" "$target.src"
+  [[ -f $current.meta ]] && mv -f -- "$current.meta" "$target.meta"
 
   # The symlink still points at the old path, so re-apply at the new one.
   if ! apply_background "$target"; then
@@ -746,7 +828,7 @@ cmd_dislike() {
     record_result failed "Could not read that image"
     return 1
   fi
-  [[ -f $current.src ]] && url=$(head -n1 -- "$current.src" 2>/dev/null)
+  url=$(read_meta "$current" | jq -r '.url // ""' 2>/dev/null)
 
   # Blocked first: without this the refetch below would be handed the very
   # same image back and dedupe it into a no-op.
@@ -776,7 +858,7 @@ cmd_dislike() {
     return 1
   fi
 
-  rm -f -- "$current" "$current.src"
+  rm -f -- "$current" "$current.src" "$current.meta"
   log "disliked $(basename -- "$current")"
   return 0
 }
@@ -855,6 +937,7 @@ cmd_status() {
     --argjson likedImages "$(count_files liked_files_sorted)" \
     --argjson blocked "$(blocked_count)" \
     --argjson paused "$([[ -e $PAUSE_FLAG ]] && echo true || echo false)" \
+    --argjson meta "$(read_meta "$current")" \
     '{
       endpoint: $endpoint,
       intervalMinutes: $interval,
@@ -866,6 +949,7 @@ cmd_status() {
       currentOrigin: $origin,
       currentIsOurs: ($origin == "pool" or $origin == "liked"),
       currentLiked: ($origin == "liked"),
+      currentMeta: $meta,
       paused: $paused,
       lastResult: $lastResult,
       lastMessage: $lastMessage,

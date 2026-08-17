@@ -5,7 +5,10 @@ timer, pulling fresh images from an HTTP endpoint you configure and keeping the
 last few locally so rotation keeps working with no internet.
 
 - Changes the background immediately when installed, then every `N` minutes.
-- Endpoint returns JSON like `{"url": "https://.../image.jpg"}`.
+- Works with no configuration: it ships pointing at `https://bkg.ssimo.dev`,
+  a CC0 wallpaper feed. Point it anywhere else from the panel.
+- An endpoint returns JSON like `{"url": "https://.../image.jpg"}`, optionally
+  with a title, who made it, and its licence — all shown in the panel.
 - An icon next to the clock opens a panel: what the service is doing, the
   endpoint, and **Keep** / **Not this** for the image on screen.
 - Kept images are safe from pruning forever. Discarded ones are deleted, never
@@ -41,8 +44,9 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable ssimo.bkg-changer --after omarchy.clock
 ```
 
-The background changes within a second or two of enabling. Click the icon by
-the clock, paste your endpoint into the field, and press Enter.
+The background changes within a second or two of enabling, using the default
+feed. To use your own, click the icon by the clock, paste the URL into the
+endpoint field and press Enter.
 
 ### Upgrading from 1.0.x
 
@@ -65,9 +69,13 @@ middle-click to rotate to the next cached one. Inside:
 | **Keep** (`f`) | Moves the image on screen into `liked/`, where pruning can never reach it. It stays in the rotation. |
 | **Not this** (`d`, or `x`) | Deletes the image, records it so it is never shown again, and fetches a replacement immediately. |
 | **Next** (`n`) | Fetches a fresh image now and restarts the clock. |
-| **Endpoint** | Writes `BG_ENDPOINT`. Enter saves, Escape reverts. Empty means "only rotate what is already downloaded". |
+| **Endpoint** | Writes `BG_ENDPOINT`. Enter saves, Escape reverts. Empty means "only rotate what is already downloaded". Defaults to `https://bkg.ssimo.dev`. |
 | **Change every / Keep** | `BG_INTERVAL_MINUTES` and `BG_KEEP_IMAGES`. The interval re-arms without a restart. |
 | **Pause rotation** (`p`) | The same flag as `omarchy-toggle bkg-changer-off`. |
+
+When the endpoint sends them, the title and a `by creator · licence · source`
+line sit under the preview. The licence and source are clickable when the
+endpoint gave URLs for them, and open in your browser.
 
 The top line says whether the plugin is running, paused or failing, when the
 last change happened and what came of it; the bottom line counts what is
@@ -80,6 +88,36 @@ The panel can also be summoned from a keybinding:
 omarchy-shell shell toggle ssimo.bkg-changer
 ```
 
+## Endpoint response
+
+The default endpoint, `https://bkg.ssimo.dev`, serves CC0 photography with full
+credits. Any endpoint works as long as it answers with JSON: only `url` is
+required, everything else is optional, and anything not listed here is
+ignored:
+
+```json
+{
+  "url": "https://upload.wikimedia.org/.../1920px-California%27s_Central_Valley.JPG",
+  "title": "California's Central Valley",
+  "creator": "Mark Miller",
+  "license": "cc0",
+  "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
+  "source": "wikimedia",
+  "sourceUrl": "https://commons.wikimedia.org/w/index.php?curid=2374537"
+}
+```
+
+The answer is a stranger's text on your desktop, so the worker keeps only those
+keys, caps each string at 200 characters, and accepts `licenseUrl` and
+`sourceUrl` only when they are `http(s)` URLs built from characters that cannot
+break out of a quoted shell word. The apostrophe is deliberately not one of
+them, which is what makes opening one in a browser safe. A field that fails any of that is dropped, and
+the panel simply does not show it. The text fields are rendered as plain text,
+never as markup.
+
+Whatever survives is stored next to the image, so the credit still shows for a
+picture that came out of the cache days later.
+
 ## Configuration
 
 `~/.config/omarchy-bkg-changer/config.env`, created with defaults on first run.
@@ -87,7 +125,7 @@ The panel edits this file for you; editing it by hand works just as well.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `BG_ENDPOINT` | `""` | JSON endpoint. Empty = rotate the local cache only. |
+| `BG_ENDPOINT` | `https://bkg.ssimo.dev` | JSON endpoint. Empty = rotate the local cache only. |
 | `BG_INTERVAL_MINUTES` | `60` | How often to change the background. |
 | `BG_KEEP_IMAGES` | `10` | How many downloaded images to keep. Kept images are not counted. |
 | `BG_TIMEOUT_SECONDS` | `20` | Per-request network timeout. |
@@ -157,12 +195,16 @@ $P set-config BG_ENDPOINT https://example.com/wallpaper.json
 | `~/.local/share/omarchy-bkg-changer/images/` | the downloaded image pool, pruned to `BG_KEEP_IMAGES` |
 | `~/.local/share/omarchy-bkg-changer/liked/` | images you kept; never pruned |
 | `~/.local/state/omarchy-bkg-changer/blocklist` | `<sha256>` + source URL of every image you discarded |
+| `<image>.meta` | JSON sidecar: the endpoint's answer for that image |
 | `~/.local/state/omarchy-bkg-changer/setup-required.png` | generated "configure me" background |
 | `~/.local/state/omarchy-bkg-changer/bkg-changer.log` | one line per run, self-truncating |
 | `~/.local/state/omarchy/current/background` | Omarchy's symlink to the active image |
 
-Each image in the pool has a small `.src` sidecar next to it holding the URL it
-came from, so discarding it can block that URL too.
+Each image carries a `.meta` sidecar holding the sanitized endpoint answer, so
+discarding it can block the URL it came from and the panel can credit it long
+after it was downloaded. An image downloaded before this
+existed has a plain `.src` sidecar holding only the URL; those are still read,
+and replaced with a `.meta` when the endpoint offers the same picture again.
 
 ## Troubleshooting
 
@@ -172,10 +214,11 @@ Check the log first: `tail ~/.local/state/omarchy-bkg-changer/bkg-changer.log`.
   `ssimo.bkg-changer` enabled. If not: `omarchy plugin enable ssimo.bkg-changer`.
 - **The plugin works but there is no icon** — the widget has to be in the bar
   layout: `omarchy bar put ssimo.bkg-changer --after omarchy.clock`.
-- **"Not this" says the endpoint only had that same image** — exactly that. Many
-  wallpaper endpoints cache one answer for everybody for an hour or more, so
-  there is nothing else to hand out yet. The discarded image is still gone and
-  still blocked; the plugin shows a cached one until the endpoint moves on.
+- **"Not this" says the endpoint only had that same image** — exactly that.
+  Many wallpaper endpoints cache one answer for everybody for minutes or hours,
+  so there is nothing else to hand out yet. The discarded image is still gone
+  and still blocked; the plugin shows a cached one until the endpoint moves
+  on.
 - **The buttons are greyed out** — the wallpaper on screen did not come from
   this plugin (a theme background, or the setup notice), so there is nothing to
   keep or discard.
@@ -186,9 +229,9 @@ Check the log first: `tail ~/.local/state/omarchy-bkg-changer/bkg-changer.log`.
   login form.
 - **Background never changes offline** — the pool is still empty. It fills up
   one image per successful run.
-- **A black background telling you to configure an endpoint** — exactly what it
-  says: `BG_ENDPOINT` is empty and nothing has been downloaded yet. Set the
-  endpoint in the panel. It is rendered at your largest monitor's resolution
+- **A black background telling you to configure an endpoint** — `BG_ENDPOINT`
+  was blanked and nothing has been downloaded yet. Put an endpoint back in the
+  panel. It is rendered at your largest monitor's resolution
   with ImageMagick, in the system's `sans-serif` font as resolved by
   `fc-match`. Without `magick` the plugin just logs and leaves the background
   alone.
