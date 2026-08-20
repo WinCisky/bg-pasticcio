@@ -391,6 +391,42 @@ Panel {
             }
           }
 
+          // --------------------------------------------------------- switch
+          //
+          // Directly under the preview because it is the one control that does
+          // anything while the plugin is off: everything below it is greyed
+          // out until this is on.
+
+          Toggle {
+            width: parent.width
+            label: "Change my background"
+            description: "Changes your wallpaper straight away, then on the "
+                         + "interval below. Turning it off puts your original back."
+            checked: root.rotationOn
+            enabled: !root.busy
+            opacity: enabled ? 1.0 : 0.4
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.setEnabled(!root.rotationOn)
+          }
+
+          // Only offered while the wallpaper this plugin found is still on
+          // disk; the worker reports that as canRestore.
+          Button {
+            visible: root.canRestore
+            text: "Restore my wallpaper"
+            iconText: "󰑙"
+            tooltipText: "Put back the background that was in use before this plugin"
+            enabled: !root.busy
+            opacity: enabled ? 1.0 : 0.4
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            onClicked: if (root.service) root.service.restore()
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
           // -------------------------------------------------------- credit
 
           Column {
@@ -488,7 +524,7 @@ Panel {
             Text {
               width: parent.width
               visible: !root.rotationOn
-              text: "Nothing will change your wallpaper until you switch it on below."
+              text: "Nothing will change your wallpaper until you switch it on above."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -668,32 +704,6 @@ Panel {
                   root.service.setConfig("BG_KEEP_IMAGES", String(next))
               }
             }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Change my background"
-            description: "Off until you say so. Turning it off again puts your "
-                         + "original wallpaper back."
-            checked: root.rotationOn
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: root.setEnabled(!root.rotationOn)
-          }
-
-          // Only offered while the wallpaper this plugin found is still on
-          // disk; the worker reports that as canRestore.
-          Button {
-            visible: root.canRestore
-            text: "Restore my wallpaper"
-            iconText: "󰑙"
-            tooltipText: "Put back the background that was in use before this plugin"
-            enabled: !root.busy
-            opacity: enabled ? 1.0 : 0.4
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            onClicked: if (root.service) root.service.restore()
           }
 
           PanelSeparator { foreground: root.foreground }

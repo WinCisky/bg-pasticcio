@@ -129,17 +129,18 @@ The `bkg-changer-off` / `bg-pasticcio-off` pause flag is gone: the panel's
 ## The panel
 
 Left-click the icon to open the panel, right-click to fetch a new image, and
-middle-click to rotate to the next cached one. Inside:
+middle-click to rotate to the next cached one. Inside, top to bottom: a preview
+of the wallpaper on screen, the switch, then everything the switch turns on.
 
 | Control | What it does |
 | --- | --- |
+| **Change my background** (`e`) | Writes `BG_ENABLED`. Off until you turn it on, and turning it on changes the wallpaper straight away rather than at the next tick of the clock; turning it off puts your original wallpaper back. Everything else in the panel is greyed out while it is off. |
+| **Restore my wallpaper** | Puts back the background that was in use before the plugin's first change. Only shown while that file is still on disk. |
 | **Keep** (`f`) | Moves the image on screen into `liked/`, where pruning can never reach it. It stays in the rotation. |
 | **Not this** (`d`, or `x`) | Deletes the image, records it so it is never shown again, and fetches a replacement immediately. |
 | **Next** (`n`) | Fetches a fresh image now and restarts the clock. |
 | **Endpoint** | Writes `BG_ENDPOINT`. Enter saves, Escape reverts. Empty means "only rotate what is already downloaded". Defaults to `https://bg.ssimo.dev`. |
 | **Change every / Keep** | `BG_INTERVAL_MINUTES` and `BG_KEEP_IMAGES`. The interval re-arms without a restart. |
-| **Change my background** (`e`) | Writes `BG_ENABLED`. Off until you turn it on; turning it off puts your original wallpaper back. Everything else in the panel is greyed out while it is off. |
-| **Restore my wallpaper** | Puts back the background that was in use before the plugin's first change. Only shown while that file is still on disk. |
 
 When the endpoint sends them, the title and a `by creator · licence · source`
 line sit under the preview. The licence and source are clickable when the
@@ -262,10 +263,13 @@ $P set-config BG_ENDPOINT https://example.com/wallpaper.json
   popup. A bar widget is built once per monitor, so the widget keeps no state —
   it calls the service, which owns the one worker process, and every copy of
   the panel therefore agrees with every other.
-- The service owns a `Timer` that only runs while `BG_ENABLED` is on, with
-  `triggeredOnStart: true` — so an installed plugin has no schedule at all, and
-  switching it on is what triggers the first change. A second, single-shot timer
-  backs off after a failed run: 1, 2, 4, 8 ... minutes, capped at the interval.
+- The service owns a `Timer` that only runs while `BG_ENABLED` is on, so an
+  installed plugin has no schedule at all. The first change is not left to that
+  timer: `onRotationOnChanged` calls `runNow()` the moment the switch goes on,
+  which is what makes turning it on — from the panel, the `e` key, IPC, or an
+  edit to `config.env` — change the background straight away, every time. A
+  second, single-shot timer backs off after a failed run: 1, 2, 4, 8 ... minutes,
+  capped at the interval.
 - Before the first background it ever applies, the worker records what was
   already in place — both the resolved file and the raw symlink target — in
   `original-background`. `restore`, and switching the toggle off, put that file

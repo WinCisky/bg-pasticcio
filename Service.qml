@@ -162,14 +162,28 @@ Item {
   function setEnabled(value) { return runWorker(value ? "enable" : "disable") }
   function restore() { return runWorker("restore") }
 
-  // Nothing is in flight while it is off, so a failure recorded before the
-  // switch was flipped must not keep the panel saying "not working".
+  // The one place the switch is acted on. Turning it on is a request to see
+  // something new now, not in an hour, so the first change is started here
+  // rather than left to a timer's side effect. It also covers the shell
+  // starting with the switch already on, and a config.env edited by hand.
+  //
+  // Turning it off: nothing is in flight any more, so a failure recorded
+  // before the switch was flipped must not keep the panel saying "not
+  // working".
   onRotationOnChanged: {
-    if (!root.rotationOn) {
-      retryTimer.stop()
-      root.consecutiveFailures = 0
-      root.lastTickMs = 0
+    if (root.rotationOn) {
+      // runNow() only declines while the worker is busy with something else,
+      // and runWorker drops what it declines without a trace — so come back
+      // for it rather than waiting out a whole interval.
+      if (!root.runNow()) {
+        retryTimer.interval = 5000
+        retryTimer.restart()
+      }
+      return
     }
+    retryTimer.stop()
+    root.consecutiveFailures = 0
+    root.lastTickMs = 0
   }
 
   function runNow() {
@@ -254,14 +268,15 @@ Item {
     ? lastTickMs + Math.max(60000, root.intervalMinutes * 60000) : 0
 
   // Only runs while the switch is on, so an installed-but-untouched plugin has
-  // no schedule at all. triggeredOnStart then makes turning it on change the
-  // background straight away, which is the response the user just asked for.
+  // no schedule at all. Deliberately without triggeredOnStart: Qt only honours
+  // that flag on a Timer's very first tick, so it cannot be relied on to change
+  // the background every time the switch is flipped on. onRotationOnChanged
+  // above does that, once, whatever started the timer.
   Timer {
     id: cycleTimer
     interval: Math.max(60000, root.intervalMinutes * 60000)
     repeat: true
     running: root.rotationOn
-    triggeredOnStart: true
     onTriggered: {
       root.lastTickMs = Date.now()
       root.runWorker("run")
