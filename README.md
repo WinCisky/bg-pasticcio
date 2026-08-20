@@ -26,6 +26,33 @@ last few locally so rotation keeps working with no internet.
   instead of doing nothing visible.
 - Configuration beyond that first toggle is optional.
 
+## Requirements
+
+Omarchy 4 with `omarchy-shell` — the plugin calls `omarchy-theme-bg-set` to
+apply a background, and is loaded by the shell's plugin registry.
+
+Everything below ships with a default Omarchy install; the worker checks for
+them on every run and logs `missing required command(s)` rather than failing
+halfway through.
+
+| Command | Package (Arch) | Used for |
+| --- | --- | --- |
+| `curl` | `curl` | fetching the endpoint and the images |
+| `jq` | `jq` | parsing the endpoint answer and printing `status` |
+| `file` | `file` | verifying downloaded bytes really are an image |
+| `sha256sum`, `stat`, `find`, `awk`, `sed` | `coreutils`, `findutils`, `gawk`, `sed` | hashing, the pool, the blocklist |
+| `flock` | `util-linux` | serialising runs |
+
+Two are optional, and only affect the "no endpoint configured" notice:
+
+| Command | Package | Without it |
+| --- | --- | --- |
+| `magick` | `imagemagick` | the setup notice is not drawn; the plugin logs and leaves the background alone |
+| `fc-match` | `fontconfig` | the notice is drawn in ImageMagick's built-in font |
+| `hyprctl` | `hyprland` | the notice is drawn at 1920x1080 instead of your largest monitor's size |
+
+No build step, no runtime beyond bash and the shell itself.
+
 ## Install
 
 ```sh
@@ -128,6 +155,21 @@ The panel can also be summoned from a keybinding:
 ```sh
 omarchy-shell shell toggle ssimo.bg-pasticcio
 ```
+
+## What leaves your machine
+
+While the toggle is off, nothing does: no request is made until you switch the
+plugin on.
+
+Once on, every `BG_INTERVAL_MINUTES` it makes two ordinary HTTPS requests — one
+to `BG_ENDPOINT`, one to the image URL that endpoint returns — with whatever
+your system `curl` sends by default. No identifiers, no telemetry, nothing
+about your machine or your ratings is transmitted; **Keep** and **Not this**
+are recorded locally and never reported back. The default endpoint,
+`https://bg.ssimo.dev`, is run by this plugin's author and sees what any web
+server sees: your IP address and User-Agent. Point `BG_ENDPOINT` somewhere else,
+or blank it to rotate only what is already on disk, and it is never contacted
+again.
 
 ## Endpoint response
 
@@ -239,6 +281,10 @@ $P set-config BG_ENDPOINT https://example.com/wallpaper.json
 - Discarding an image records its content hash and source URL in a blocklist.
   Both are checked on the next fetch, so a blocked image is rejected before it
   is downloaded when possible, and thrown away after hashing when not.
+- Downloads are capped: `curl` is pinned to `http`/`https` (redirects included,
+  so an endpoint cannot bounce the fetch into `file://`), given the configured
+  timeout, and stopped at 64 MB. URLs are stripped out of logged network errors,
+  since an endpoint URL can carry a token.
 - Runs are serialised with `flock`, so a timer tick and a manual
   `omarchy-shell bgpasticcio next` cannot race. `status` and `set-config` do not
   take the lock, so the panel stays responsive during a download.
@@ -295,6 +341,8 @@ Check the log first: `tail ~/.local/state/bg-pasticcio/bg-pasticcio.log`.
   with ImageMagick, in the system's `sans-serif` font as resolved by
   `fc-match`. Without `magick` the plugin just logs and leaves the background
   alone.
+- **`missing required command(s)`** — install what it names; the table under
+  [Requirements](#requirements) says which package each one is in.
 - **Editing the QML changes nothing** — the shell caches compiled QML per file
   URL, so a `rescanPlugins` can hand you the previous version. Run
   `omarchy-restart-shell` while developing.
@@ -326,3 +374,11 @@ rm -rf ~/.config/bg-pasticcio \
 Note that if the wallpaper in use still came from the pool, delete it only
 after picking another background (`omarchy theme bg next`), or the desktop is
 left pointing at a file that no longer exists.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Simone Simonella.
+
+The plugin ships no images of its own. Wallpapers come from whatever endpoint
+you point it at, under that endpoint's terms; the default feed serves CC0
+photography and sends the credit line the panel displays.

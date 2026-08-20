@@ -52,6 +52,15 @@ DEFAULT_ENDPOINT="https://bg.ssimo.dev"
 LOG_MAX_BYTES=262144
 LOG_KEEP_LINES=200
 
+# A wallpaper is a few megabytes; anything wildly larger is a mistake or a
+# hostile endpoint trying to fill the disk, and curl stops rather than storing
+# it. Applies to the JSON answer too, which should be a few hundred bytes.
+MAX_DOWNLOAD_BYTES=$((64 * 1024 * 1024))
+
+# Everything the worker cannot do without. Checked once, so a missing package
+# says so in the log instead of failing somewhere deep in a pipeline.
+REQUIRED_COMMANDS=(curl jq file sha256sum flock find)
+
 # Same extension set Omarchy itself accepts for backgrounds.
 FIND_EXT=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
   -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp')
@@ -179,6 +188,16 @@ load_config() {
   is_positive_int "$BG_MAX_RETRIES" || BG_MAX_RETRIES=4
   is_positive_int "$BG_RETRY_BASE_SECONDS" || BG_RETRY_BASE_SECONDS=2
   is_positive_int "$BG_BLOCKED_RETRIES" || BG_BLOCKED_RETRIES=3
+}
+
+check_dependencies() {
+  local missing=() tool
+  for tool in "${REQUIRED_COMMANDS[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  ((${#missing[@]} == 0)) && return 0
+  log "ERROR missing required command(s): ${missing[*]}"
+  return 1
 }
 
 is_positive_int() {
@@ -542,12 +561,19 @@ curl_with_backoff() {
   local errfile="$STATE_DIR/.curl-err.$$"
   while :; do
     # `&&` rather than `if`, so $? below is curl's status and not the `if`'s.
-    curl -fsSL --max-time "$BG_TIMEOUT_SECONDS" "$@" 2>"$errfile" && {
+    # Explicit protocols: an endpoint must not be able to redirect the fetch
+    # into file:// or scp://, whatever the local curl's defaults happen to be.
+    curl -fsSL \
+      --proto '=http,https' --proto-redir '=http,https' \
+      --max-filesize "$MAX_DOWNLOAD_BYTES" \
+      --max-time "$BG_TIMEOUT_SECONDS" "$@" 2>"$errfile" && {
       rm -f -- "$errfile"
       return 0
     }
     rc=$?
-    reason=$(tail -n1 -- "$errfile" 2>/dev/null | tr -d '\r')
+    # curl names the URL it failed on, and an endpoint URL can carry a token,
+    # so keep the host and the reason out of the log's reach.
+    reason=$(tail -n1 -- "$errfile" 2>/dev/null | tr -d '\r' | sed -E 's#[a-z]+://[^ ]*#<url>#g')
     : "${reason:=curl exit $rc}"
     if ((attempt >= BG_MAX_RETRIES)); then
       log "WARN gave up after $attempt attempt(s): $reason"
@@ -577,7 +603,13 @@ META_MAX_TEXT=200
 sanitize_meta() {
   jq -c --argjson max "$META_MAX_TEXT" '
     def clean_text:
-      if type == "string" and (. | length) > 0 then .[0:$max] else null end;
+      # Angle brackets are stripped, not escaped: a QML Text defaults to
+      # AutoText and renders anything that looks like HTML as rich text, and
+      # not every label these strings reach is one this plugin controls.
+      if type == "string" and (. | length) > 0
+      then (. | gsub("[<>]"; "") | .[0:$max])
+      else null end
+      | if . == "" then null else . end;
     def clean_url:
       if type == "string" and test("^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$")
       then . else null end;
@@ -1108,6 +1140,7 @@ cmd_status() {
 main() {
   load_config
   rotate_log
+  check_dependencies || return 1
 
   local command=${1:-run}
   case "$command" in

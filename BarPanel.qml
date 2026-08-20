@@ -233,6 +233,10 @@ Panel {
     font.pixelSize: Style.font.caption
     font.underline: credit.linkable && creditHover.hovered
     elide: Text.ElideRight
+    // Never markup: this text came off the network. The worker strips angle
+    // brackets too, because a Text defaults to AutoText and would otherwise
+    // render what looks like HTML as rich text.
+    textFormat: Text.PlainText
 
     HoverHandler {
       id: creditHover
@@ -401,6 +405,7 @@ Panel {
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
+              textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               maximumLineCount: 2
               elide: Text.ElideRight
@@ -476,6 +481,7 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+              textFormat: Text.PlainText
               wrapMode: Text.WordWrap
             }
 
@@ -715,6 +721,7 @@ Panel {
               color: Qt.darker(root.foreground, 2.0)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
               elide: Text.ElideRight
               maximumLineCount: 1
             }
