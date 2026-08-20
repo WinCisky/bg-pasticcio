@@ -6,15 +6,22 @@
 # points at, applies it as the desktop background and keeps a small local pool
 # so rotation keeps working with no network.
 #
-# Usage: bg-pasticcio [run|next|like|dislike|set-config|status|interval]
+# Usage: bg-pasticcio [run|next|like|dislike|enable|disable|restore|...]
 #
 #   run                   fetch a fresh image and apply it; falls back to `next`
 #   next                  rotate to the next image already on disk (no network)
 #   like                  keep the current image for good, safe from pruning
 #   dislike               never show the current image again, and replace it now
+#   enable                allow the plugin to change the background
+#   disable               stop it, and put the original background back
+#   restore               put the background from before the first change back
 #   set-config KEY VALUE  change one setting in config.env
 #   status                print JSON describing config, pool and last run
 #   interval              print the configured interval in minutes
+#
+# Nothing here touches the background until BG_ENABLED is turned on: the plugin
+# is installed off, and the wallpaper it finds in place is remembered before it
+# replaces it, so `restore` can always put things back.
 #
 # Deliberately not `set -e`: every failure is handled and downgraded to the
 # offline rotation path, because a wallpaper that stops changing is the bug we
@@ -33,10 +40,10 @@ LOCK_FILE="$STATE_DIR/lock"
 LAST_FILE="$STATE_DIR/last"
 BLOCKLIST_FILE="$STATE_DIR/blocklist"
 NOTICE_IMAGE="$STATE_DIR/setup-required.png"
+ORIGINAL_FILE="$STATE_DIR/original-background"
 
 OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 CURRENT_LINK="$OMARCHY_STATE/current/background"
-PAUSE_FLAG="$OMARCHY_STATE/toggles/bg-pasticcio-off"
 
 # Works out of the box: a CC0 wallpaper feed that also sends title, creator and
 # licence. Blank it in config.env to rotate only what is already downloaded.
@@ -84,7 +91,14 @@ write_default_config() {
   # the shell expanding something in the comments.
   cat >"$CONFIG_FILE" <<'EOF'
 # bg-pasticcio — configuration.
-# Edit freely; changes to BG_INTERVAL_MINUTES are picked up without a restart.
+# Edit freely; changes to BG_ENABLED and BG_INTERVAL_MINUTES are picked up
+# without a restart.
+
+# Whether the plugin may change your background at all. It ships off: nothing
+# is touched until you turn this on, from the panel in the bar or with
+# `bg-pasticcio enable`. Turning it off again puts your original background
+# back, if it is still on disk.
+BG_ENABLED=0
 
 # Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}, and
 # optionally a title, creator and licence for it.
@@ -116,7 +130,7 @@ BG_BLOCKED_RETRIES=3
 EOF
 }
 
-CONFIG_KEYS=(BG_ENDPOINT BG_INTERVAL_MINUTES BG_KEEP_IMAGES
+CONFIG_KEYS=(BG_ENABLED BG_ENDPOINT BG_INTERVAL_MINUTES BG_KEEP_IMAGES
   BG_TIMEOUT_SECONDS BG_MAX_RETRIES BG_RETRY_BASE_SECONDS BG_BLOCKED_RETRIES)
 
 load_config() {
@@ -130,6 +144,7 @@ load_config() {
     [[ -v $key ]] && env_override[$key]=${!key}
   done
 
+  BG_ENABLED=0
   BG_ENDPOINT="$DEFAULT_ENDPOINT"
   BG_INTERVAL_MINUTES=60
   BG_KEEP_IMAGES=10
@@ -153,6 +168,10 @@ load_config() {
     printf -v "$key" '%s' "${env_override[$key]}"
   done
 
+  # A hand-edited file may say true/yes/on; the rest of the script only ever
+  # sees 0 or 1, and anything unrecognisable means off.
+  is_truthy "$BG_ENABLED" && BG_ENABLED=1 || BG_ENABLED=0
+
   # A malformed number must not turn into an infinite loop or a zero interval.
   is_positive_int "$BG_INTERVAL_MINUTES" || BG_INTERVAL_MINUTES=60
   is_positive_int "$BG_KEEP_IMAGES" || BG_KEEP_IMAGES=10
@@ -164,6 +183,20 @@ load_config() {
 
 is_positive_int() {
   [[ ${1:-} =~ ^[0-9]+$ ]] && ((${1} > 0))
+}
+
+is_truthy() {
+  case "${1,,}" in
+    1 | true | yes | on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_falsy() {
+  case "${1,,}" in
+    0 | false | no | off) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # config.env is `source`d by this script, so a value typed into the panel
@@ -179,6 +212,9 @@ config_value_safe() {
 config_value_valid() {
   local key=$1 value=${2-}
   case "$key" in
+    BG_ENABLED)
+      is_truthy "$value" || is_falsy "$value"
+      ;;
     BG_ENDPOINT)
       [[ -z $value ]] && return 0
       local url_re='^https?://[A-Za-z0-9._~:/?#@!&'"'"'()*+,;=%-]+$'
@@ -246,8 +282,56 @@ bg_set_bin() {
   return 1
 }
 
+# The background in place before this plugin ever changed it, so uninstalling
+# can leave the desktop as it was found. Written once, from apply_background
+# below — the one point every path that changes the wallpaper goes through.
+#
+# Two fields: the resolved file, and the raw symlink target. Omarchy points the
+# symlink at "current/theme/backgrounds/...", which is itself a symlink that
+# follows the active theme, so the resolved path is the honest answer and the
+# target is the fallback for a file that moved with a theme update.
+remember_original_background() {
+  [[ -e $ORIGINAL_FILE ]] && return 0
+
+  local resolved target origin
+  resolved=$(readlink -f -- "$CURRENT_LINK" 2>/dev/null)
+  target=$(readlink -- "$CURRENT_LINK" 2>/dev/null)
+
+  # Never record one of ours: a pool image, a kept one, or our own notice.
+  if [[ -n $resolved ]]; then
+    origin=$(image_origin "$resolved") || origin="none"
+    if [[ $origin == pool || $origin == liked || $resolved == "$NOTICE_IMAGE" ]]; then
+      resolved=""
+      target=""
+    fi
+  fi
+
+  # Written even when both fields are empty — there simply was no background to
+  # remember, and the file existing is what stops us looking again later.
+  printf '%s\t%s\n' "$resolved" "$target" >"$ORIGINAL_FILE" 2>/dev/null
+  [[ -n $resolved ]] && log "remembered the background that was in place: $resolved"
+  return 0
+}
+
+# Prints the path `restore` would put back, or nothing when there is none left.
+original_background() {
+  [[ -f $ORIGINAL_FILE ]] || return 1
+  local resolved target
+  IFS=$'\t' read -r resolved target <"$ORIGINAL_FILE"
+  if [[ -n $resolved && -f $resolved ]]; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  if [[ -n $target && -f $target ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+  return 1
+}
+
 apply_background() {
   local image=$1 setter output rc
+  remember_original_background
   if ! setter=$(bg_set_bin); then
     log "ERROR omarchy-theme-bg-set not found; is Omarchy installed?"
     return 1
@@ -700,12 +784,17 @@ fetch_fresh_image() {
 
 # ------------------------------------------------------------- subcommands
 
+# Nothing that changes what is on screen runs until the user has said yes. This
+# is the whole of that promise: one gate, checked by every such subcommand.
+require_enabled() {
+  ((BG_ENABLED)) && return 0
+  log "turned off (BG_ENABLED=0), leaving the background alone"
+  record_result disabled "Turned off — nothing is changing your background"
+  return 1
+}
+
 cmd_run() {
-  if [[ -e $PAUSE_FLAG ]]; then
-    log "paused ($PAUSE_FLAG exists), skipping"
-    record_result paused "Rotation is paused"
-    return 0
-  fi
+  require_enabled || return 0
 
   if [[ -z $BG_ENDPOINT ]]; then
     log "BG_ENDPOINT is not set in $CONFIG_FILE, rotating what is on disk"
@@ -748,11 +837,7 @@ cmd_run() {
 }
 
 cmd_next() {
-  if [[ -e $PAUSE_FLAG ]]; then
-    log "paused ($PAUSE_FLAG exists), skipping"
-    record_result paused "Rotation is paused"
-    return 0
-  fi
+  require_enabled || return 0
   if rotate_pool; then
     record_result rotated "Rotated to the next cached image"
     return 0
@@ -766,6 +851,7 @@ cmd_next() {
 }
 
 cmd_like() {
+  require_enabled || return 0
   local current origin
   current=$(current_background)
   if ! origin=$(image_origin "$current"); then
@@ -809,6 +895,7 @@ cmd_like() {
 }
 
 cmd_dislike() {
+  require_enabled || return 0
   local current origin
   current=$(current_background)
   if ! origin=$(image_origin "$current"); then
@@ -860,6 +947,55 @@ cmd_dislike() {
 
   rm -f -- "$current" "$current.src" "$current.meta"
   log "disliked $(basename -- "$current")"
+  return 0
+}
+
+cmd_restore() {
+  local original
+  if ! original=$(original_background); then
+    if [[ -f $ORIGINAL_FILE ]]; then
+      log "the background from before is gone, leaving the current one alone"
+      record_result failed "Your original background is no longer on disk"
+    else
+      log "no earlier background was ever recorded, nothing to restore"
+      record_result failed "There is no earlier background to restore"
+    fi
+    return 1
+  fi
+
+  if [[ $original == "$(current_background)" ]]; then
+    log "the original background is already in use"
+    record_result restored "Your original background is already showing"
+    return 0
+  fi
+
+  if ! apply_background "$original"; then
+    record_result failed "Could not put your original background back"
+    return 1
+  fi
+  log "restored the original background"
+  record_result restored "Put your original background back"
+  return 0
+}
+
+cmd_enable() {
+  cmd_set_config BG_ENABLED 1 || return 1
+  log "enabled"
+  record_result enabled "Turned on"
+  return 0
+}
+
+# Turning it off is also the undo: the desktop goes back to the wallpaper the
+# plugin found. A missing original must not fail the disable, though — the
+# setting is what the user asked for, the restore is a courtesy.
+cmd_disable() {
+  cmd_set_config BG_ENABLED 0 || return 1
+  log "disabled"
+  if cmd_restore; then
+    record_result disabled "Turned off, and put your original background back"
+  else
+    record_result disabled "Turned off"
+  fi
   return 0
 }
 
@@ -920,6 +1056,9 @@ cmd_status() {
   current=$(current_background)
   origin=$(image_origin "$current") || origin="none"
 
+  local original=""
+  original=$(original_background) || original=""
+
   jq -n \
     --arg endpoint "$BG_ENDPOINT" \
     --arg current "$current" \
@@ -936,7 +1075,8 @@ cmd_status() {
     --argjson stored "$(count_files pool_files_sorted)" \
     --argjson likedImages "$(count_files liked_files_sorted)" \
     --argjson blocked "$(blocked_count)" \
-    --argjson paused "$([[ -e $PAUSE_FLAG ]] && echo true || echo false)" \
+    --arg original "$original" \
+    --argjson enabled "$( ((BG_ENABLED)) && echo true || echo false)" \
     --argjson meta "$(read_meta "$current")" \
     '{
       endpoint: $endpoint,
@@ -950,7 +1090,9 @@ cmd_status() {
       currentIsOurs: ($origin == "pool" or $origin == "liked"),
       currentLiked: ($origin == "liked"),
       currentMeta: $meta,
-      paused: $paused,
+      enabled: $enabled,
+      originalBackground: $original,
+      canRestore: ($original != "" and $original != $current),
       lastResult: $lastResult,
       lastMessage: $lastMessage,
       lastLog: $lastLog,
@@ -985,7 +1127,7 @@ main() {
       ;;
   esac
 
-  # Only the commands that touch the pool need the lock: a timer tick and a
+  # Only the commands that touch the pool or the wallpaper need the lock: a timer tick and a
   # manual IPC call must never race each other into it.
   exec 9>"$LOCK_FILE" || {
     log "ERROR cannot open lock file $LOCK_FILE"
@@ -1001,8 +1143,11 @@ main() {
     next | rotate) cmd_next ;;
     like) cmd_like ;;
     dislike) cmd_dislike ;;
+    enable) cmd_enable ;;
+    disable) cmd_disable ;;
+    restore) cmd_restore ;;
     *)
-      printf 'Usage: %s [run|next|like|dislike|set-config KEY VALUE|status|interval]\n' \
+      printf 'Usage: %s [run|next|like|dislike|enable|disable|restore|set-config KEY VALUE|status|interval]\n' \
         "${0##*/}" >&2
       return 2
       ;;

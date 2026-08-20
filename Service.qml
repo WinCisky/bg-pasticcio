@@ -38,13 +38,31 @@ Item {
   property int consecutiveFailures: 0
   property string lastResult: "never-run"
 
+  // Off until the user says otherwise. Everything below is arranged so that a
+  // freshly installed plugin loads, draws its panel, and changes nothing: the
+  // schedule does not run, and the worker refuses every command that would
+  // touch the wallpaper. `BG_ENABLED` in config.env is the one switch.
+  property bool rotationOn: false
+
   // ------------------------------------------------------------------ config
   //
   // The worker is the source of truth for the config file; the shell only
-  // needs the interval, so parse that one key rather than a full env parser.
+  // needs the interval and the switch, so parse those two keys rather than a
+  // full env parser.
   function applyConfigText(text) {
+    var body = text || ""
+
+    var on = false
+    var enabledMatch = /^[ \t]*(?:export[ \t]+)?BG_ENABLED[ \t]*=[ \t]*["']?([A-Za-z0-9]+)["']?/m.exec(body)
+    if (enabledMatch)
+      on = ["1", "true", "yes", "on"].indexOf(String(enabledMatch[1]).toLowerCase()) >= 0
+    if (on !== root.rotationOn) {
+      root.rotationOn = on
+      console.log("bg-pasticcio: rotation is now " + (on ? "on" : "off"))
+    }
+
     var minutes = root.defaultIntervalMinutes
-    var match = /^[ \t]*(?:export[ \t]+)?BG_INTERVAL_MINUTES[ \t]*=[ \t]*["']?([0-9]+)["']?/m.exec(text || "")
+    var match = /^[ \t]*(?:export[ \t]+)?BG_INTERVAL_MINUTES[ \t]*=[ \t]*["']?([0-9]+)["']?/m.exec(body)
     if (match)
       minutes = parseInt(match[1], 10)
     if (!isFinite(minutes) || minutes < 1)
@@ -138,6 +156,22 @@ Item {
   function dislike() { return runWorker("dislike") }
   function rotate() { return runWorker("rotate") }
 
+  // Consent, and the undo for it. `disable` also puts the original background
+  // back, which is why both go through the worker rather than through
+  // setConfig: only the worker takes the lock that makes that safe.
+  function setEnabled(value) { return runWorker(value ? "enable" : "disable") }
+  function restore() { return runWorker("restore") }
+
+  // Nothing is in flight while it is off, so a failure recorded before the
+  // switch was flipped must not keep the panel saying "not working".
+  onRotationOnChanged: {
+    if (!root.rotationOn) {
+      retryTimer.stop()
+      root.consecutiveFailures = 0
+      root.lastTickMs = 0
+    }
+  }
+
   function runNow() {
     retryTimer.stop()
     var started = runWorker("run")
@@ -149,7 +183,10 @@ Item {
   Process {
     id: worker
     onExited: function (exitCode) {
-      // Whatever the outcome, the pool and the wallpaper may have moved.
+      // Whatever the outcome, the pool and the wallpaper may have moved — and
+      // `enable`/`disable` rewrote config.env, so re-read it now rather than
+      // waiting out the 30s poll.
+      configFile.reload()
       root.refreshStatus()
 
       if (exitCode === 0) {
@@ -216,13 +253,14 @@ Item {
   readonly property double nextRunMs: lastTickMs > 0
     ? lastTickMs + Math.max(60000, root.intervalMinutes * 60000) : 0
 
-  // triggeredOnStart is what makes the background change the moment the plugin
-  // is installed and enabled — no user action, no waiting for the first hour.
+  // Only runs while the switch is on, so an installed-but-untouched plugin has
+  // no schedule at all. triggeredOnStart then makes turning it on change the
+  // background straight away, which is the response the user just asked for.
   Timer {
     id: cycleTimer
     interval: Math.max(60000, root.intervalMinutes * 60000)
     repeat: true
-    running: true
+    running: root.rotationOn
     triggeredOnStart: true
     onTriggered: {
       root.lastTickMs = Date.now()
@@ -261,8 +299,25 @@ Item {
       return root.dislike() ? "running" : "busy"
     }
 
+    // Let the plugin change the background, from now on.
+    function enable(): string {
+      return root.setEnabled(true) ? "running" : "busy"
+    }
+
+    // Stop it, and put the original background back if it is still there.
+    function disable(): string {
+      return root.setEnabled(false) ? "running" : "busy"
+    }
+
+    // Put the background from before the first change back, without changing
+    // the switch.
+    function restore(): string {
+      return root.restore() ? "running" : "busy"
+    }
+
     function status(): string {
       var merged = {
+        enabled: root.rotationOn,
         intervalMinutes: root.intervalMinutes,
         running: root.busy,
         lastResult: root.lastResult,
@@ -281,6 +336,7 @@ Item {
 
   Component.onCompleted: {
     console.log("bg-pasticcio: service loaded, worker=" + root.workerPath)
+    configFile.reload()
     root.refreshStatus()
   }
 }

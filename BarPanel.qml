@@ -35,7 +35,11 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property bool paused: status.paused === true
+  // The consent switch, owned by the service and stored in config.env. While
+  // it is off the plugin changes nothing, so every control that would change
+  // the wallpaper is disabled with it.
+  readonly property bool rotationOn: status.enabled === true
+  readonly property bool canRestore: status.canRestore === true
   readonly property bool failing: service ? service.consecutiveFailures > 0 : false
   readonly property bool busy: service ? service.busy : false
   readonly property bool ours: status.currentIsOurs === true
@@ -95,8 +99,8 @@ Panel {
   readonly property string headline: {
     if (root.busy)
       return "Working…"
-    if (root.paused)
-      return "Paused"
+    if (!root.rotationOn)
+      return "Off"
     if (root.failing)
       return "Not working"
     if (root.endpoint === "")
@@ -104,8 +108,8 @@ Panel {
     return "Running"
   }
 
-  readonly property color headlineColor: root.failing ? root.urgent
-    : (root.paused || root.endpoint === "" ? root.dim : root.foreground)
+  readonly property color headlineColor: (root.failing && root.rotationOn) ? root.urgent
+    : (!root.rotationOn || root.endpoint === "" ? root.dim : root.foreground)
 
   readonly property string detailLine: {
     var message = String(root.status.lastMessage || "")
@@ -153,19 +157,9 @@ Panel {
       root.bar.run("xdg-open '" + value + "'")
   }
 
-  function setPaused(value) {
-    if (!root.bar)
-      return
-    root.bar.run("omarchy-toggle bg-pasticcio-off " + (value ? "on" : "off"))
-    pauseSettleTimer.restart()
-  }
-
-  // omarchy-toggle is fire-and-forget, so there is nothing to wait on; give
-  // the flag a moment to land before asking the worker what it sees.
-  Timer {
-    id: pauseSettleTimer
-    interval: 250
-    onTriggered: if (root.service) root.service.refreshStatus()
+  function setEnabled(value) {
+    if (root.service)
+      root.service.setEnabled(value)
   }
 
   Timer {
@@ -259,8 +253,8 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "󰸉"
-    active: root.failing
-    dimmed: root.paused && !root.failing
+    active: root.failing && root.rotationOn
+    dimmed: !root.rotationOn
     tooltipText: (root.metaTitle !== "" ? root.metaTitle + " — " : "")
                  + root.headline + " · " + root.detailLine
     onPressed: function (mouseButton) {
@@ -299,9 +293,15 @@ Panel {
 
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
-      onDeleteRequested: if (root.ours && !root.busy && root.service) root.service.dislike()
+      onDeleteRequested: if (root.rotationOn && root.ours && !root.busy && root.service) root.service.dislike()
       onTextKey: function (character) {
         if (!root.service || root.busy)
+          return
+        if (character === "e" || character === "E") {
+          root.setEnabled(!root.rotationOn)
+          return
+        }
+        if (!root.rotationOn)
           return
         if (character === "f" || character === "F") {
           if (root.ours && !root.liked)
@@ -311,8 +311,6 @@ Panel {
             root.service.dislike()
         } else if (character === "n" || character === "N") {
           root.service.runNow()
-        } else if (character === "p" || character === "P") {
-          root.setPaused(!root.paused)
         }
       }
 
@@ -464,7 +462,7 @@ Panel {
 
               Text {
                 anchors.baseline: headlineText.baseline
-                visible: !root.paused && root.untilNextRun() !== ""
+                visible: root.rotationOn && root.untilNextRun() !== ""
                 text: "· next " + root.untilNextRun()
                 color: root.dim
                 font.family: root.fontFamily
@@ -478,6 +476,16 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              visible: !root.rotationOn
+              text: "Nothing will change your wallpaper until you switch it on below."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
           }
@@ -494,7 +502,7 @@ Panel {
               tooltipText: root.liked
                 ? "Already kept — it will not be pruned"
                 : "Keep this one for good (f)"
-              enabled: root.ours && !root.liked && !root.busy
+              enabled: root.rotationOn && root.ours && !root.liked && !root.busy
               opacity: enabled ? 1.0 : 0.4
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -506,7 +514,7 @@ Panel {
               text: "Not this"
               iconText: "󰩹"
               tooltipText: "Delete it, never show it again, fetch another (d)"
-              enabled: root.ours && !root.busy
+              enabled: root.rotationOn && root.ours && !root.busy
               opacity: enabled ? 1.0 : 0.4
               foreground: root.foreground
               accent: root.urgent
@@ -519,7 +527,7 @@ Panel {
               text: "Next"
               iconText: "󰑐"
               tooltipText: "Fetch a new image now and restart the clock (n)"
-              enabled: !root.busy
+              enabled: root.rotationOn && !root.busy
               opacity: enabled ? 1.0 : 0.4
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -530,7 +538,7 @@ Panel {
 
           Text {
             width: parent.width
-            visible: !root.ours && !!root.status.currentBackground
+            visible: root.rotationOn && !root.ours && !!root.status.currentBackground
             text: "The wallpaper on screen did not come from here, so there is nothing to rate."
             color: root.dim
             font.family: root.fontFamily
@@ -658,12 +666,28 @@ Panel {
 
           Toggle {
             width: parent.width
-            label: "Pause rotation"
-            description: "Keeps the plugin loaded, stops it changing the background"
-            checked: root.paused
+            label: "Change my background"
+            description: "Off until you say so. Turning it off again puts your "
+                         + "original wallpaper back."
+            checked: root.rotationOn
             foreground: root.foreground
             fontFamily: root.fontFamily
-            onClicked: root.setPaused(!root.paused)
+            onClicked: root.setEnabled(!root.rotationOn)
+          }
+
+          // Only offered while the wallpaper this plugin found is still on
+          // disk; the worker reports that as canRestore.
+          Button {
+            visible: root.canRestore
+            text: "Restore my wallpaper"
+            iconText: "󰑙"
+            tooltipText: "Put back the background that was in use before this plugin"
+            enabled: !root.busy
+            opacity: enabled ? 1.0 : 0.4
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            onClicked: if (root.service) root.service.restore()
           }
 
           PanelSeparator { foreground: root.foreground }
