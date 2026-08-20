@@ -21,13 +21,13 @@ import qs.Ui
 Panel {
   id: root
 
-  moduleName: "ssimo.bkg-changer"
-  // No ipcTarget either: the service already answers on `bkgchanger`, and a
+  moduleName: "ssimo.bg-pasticcio"
+  // No ipcTarget either: the service already answers on `bgpasticcio`, and a
   // handler declared here would register once per monitor. The shell can still
   // summon this panel, because it routes on open()/close()/opened.
   manageIpc: false
 
-  readonly property var service: bar?.shell?.serviceFor("ssimo.bkg-changer")
+  readonly property var service: bar?.shell?.serviceFor("ssimo.bg-pasticcio")
   readonly property var status: service ? (service.workerStatus || ({})) : ({})
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -156,7 +156,7 @@ Panel {
   function setPaused(value) {
     if (!root.bar)
       return
-    root.bar.run("omarchy-toggle bkg-changer-off " + (value ? "on" : "off"))
+    root.bar.run("omarchy-toggle bg-pasticcio-off " + (value ? "on" : "off"))
     pauseSettleTimer.restart()
   }
 

@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# bkg-changer — worker for the Omarchy "Background Changer" plugin.
+# bg-pasticcio — worker for the Omarchy background-rotation plugin.
 #
 # Fetches a JSON document from a configurable endpoint, downloads the image it
 # points at, applies it as the desktop background and keeps a small local pool
 # so rotation keeps working with no network.
 #
-# Usage: bkg-changer [run|next|like|dislike|set-config|status|interval]
+# Usage: bg-pasticcio [run|next|like|dislike|set-config|status|interval]
 #
 #   run                   fetch a fresh image and apply it; falls back to `next`
 #   next                  rotate to the next image already on disk (no network)
@@ -22,13 +22,13 @@
 
 set -uo pipefail
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-bkg-changer"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bg-pasticcio"
 CONFIG_FILE="$CONFIG_DIR/config.env"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-bkg-changer"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bg-pasticcio"
 POOL_DIR="$DATA_DIR/images"
 LIKED_DIR="$DATA_DIR/liked"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-bkg-changer"
-LOG_FILE="$STATE_DIR/bkg-changer.log"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bg-pasticcio"
+LOG_FILE="$STATE_DIR/bg-pasticcio.log"
 LOCK_FILE="$STATE_DIR/lock"
 LAST_FILE="$STATE_DIR/last"
 BLOCKLIST_FILE="$STATE_DIR/blocklist"
@@ -36,11 +36,11 @@ NOTICE_IMAGE="$STATE_DIR/setup-required.png"
 
 OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 CURRENT_LINK="$OMARCHY_STATE/current/background"
-PAUSE_FLAG="$OMARCHY_STATE/toggles/bkg-changer-off"
+PAUSE_FLAG="$OMARCHY_STATE/toggles/bg-pasticcio-off"
 
 # Works out of the box: a CC0 wallpaper feed that also sends title, creator and
 # licence. Blank it in config.env to rotate only what is already downloaded.
-DEFAULT_ENDPOINT="https://bkg.ssimo.dev"
+DEFAULT_ENDPOINT="https://bg.ssimo.dev"
 
 LOG_MAX_BYTES=262144
 LOG_KEEP_LINES=200
@@ -83,7 +83,7 @@ write_default_config() {
   # rest is a quoted heredoc: one place to change the default, and no risk of
   # the shell expanding something in the comments.
   cat >"$CONFIG_FILE" <<'EOF'
-# Omarchy Background Changer — configuration.
+# bg-pasticcio — configuration.
 # Edit freely; changes to BG_INTERVAL_MINUTES are picked up without a restart.
 
 # Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}, and
@@ -123,7 +123,7 @@ load_config() {
   mkdir -p "$CONFIG_DIR" "$POOL_DIR" "$LIKED_DIR" "$STATE_DIR" 2>/dev/null
 
   # Anything already in the environment wins over the config file, which makes
-  # `BG_ENDPOINT=... bkg-changer run` usable for testing without editing config.
+  # `BG_ENDPOINT=... bg-pasticcio run` usable for testing without editing config.
   local key
   declare -A env_override=()
   for key in "${CONFIG_KEYS[@]}"; do
@@ -412,7 +412,7 @@ and set BG_ENDPOINT to a URL returning
 
 {"url": "https://example.com/image.jpg"}
 
-Then run  omarchy-shell bkgchanger next
+Then run  omarchy-shell bgpasticcio next
 to change the background right away.
 EOF
 }
@@ -422,7 +422,7 @@ empty_notice_body() {
 That image is gone and there is nothing else cached.
 
 The next scheduled run will fetch a new one, or open the
-Background Changer panel in the bar and pick "Next" to
+bg-pasticcio panel in the bar and pick "Next" to
 try the endpoint right now.
 EOF
 }

@@ -5,7 +5,7 @@ import Quickshell.Io
 // Headless service plugin: owns the schedule, the bash worker owns the work.
 //
 // Everything that can fail (network, disk, applying the wallpaper) lives in
-// bin/bkg-changer. This file only decides *when* to call it and how long to
+// bin/bg-pasticcio. This file only decides *when* to call it and how long to
 // wait after a failure.
 //
 // It is also the plugin's single backend. A bar widget is built once per
@@ -19,7 +19,7 @@ Item {
   property var manifest: null
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string configPath: home + "/.config/omarchy-bkg-changer/config.env"
+  readonly property string configPath: home + "/.config/bg-pasticcio/config.env"
 
   // Qt.resolvedUrl gives a file:// URL; Process needs a plain path.
   readonly property string pluginDir: {
@@ -30,7 +30,7 @@ Item {
       url = url.substring(0, url.length - 1)
     return decodeURIComponent(url)
   }
-  readonly property string workerPath: pluginDir + "/bin/bkg-changer"
+  readonly property string workerPath: pluginDir + "/bin/bg-pasticcio"
 
   readonly property int defaultIntervalMinutes: 60
   property int intervalMinutes: defaultIntervalMinutes
@@ -51,7 +51,7 @@ Item {
       minutes = root.defaultIntervalMinutes
     if (minutes !== root.intervalMinutes) {
       root.intervalMinutes = minutes
-      console.log("bkg-changer: interval is now " + minutes + " minute(s)")
+      console.log("bg-pasticcio: interval is now " + minutes + " minute(s)")
     }
   }
 
@@ -79,7 +79,7 @@ Item {
   // ------------------------------------------------------------------ status
   //
   // The full picture — pool counts, ratings, what is on screen — is whatever
-  // `bkg-changer status` last said. Panels read this rather than shelling out
+  // `bg-pasticcio status` last said. Panels read this rather than shelling out
   // themselves, so N monitors still means one process.
   property var workerStatus: ({})
 
@@ -106,7 +106,7 @@ Item {
         try {
           root.workerStatus = JSON.parse(raw)
         } catch (e) {
-          console.warn("bkg-changer: could not parse status: " + e)
+          console.warn("bg-pasticcio: could not parse status: " + e)
         }
       }
     }
@@ -126,7 +126,7 @@ Item {
 
   function runWorker(command) {
     if (worker.running) {
-      console.log("bkg-changer: worker already running, skipping " + command)
+      console.log("bg-pasticcio: worker already running, skipping " + command)
       return false
     }
     worker.command = [root.workerPath, command]
@@ -168,7 +168,7 @@ Item {
       var ceiling = root.intervalMinutes * 60000
       retryTimer.interval = Math.max(60000, Math.min(delay, ceiling))
       retryTimer.restart()
-      console.warn("bkg-changer: run failed (exit " + exitCode + "), retrying in "
+      console.warn("bg-pasticcio: run failed (exit " + exitCode + "), retrying in "
                    + Math.round(retryTimer.interval / 60000) + " minute(s)")
     }
   }
@@ -204,7 +204,7 @@ Item {
       root.refreshStatus()
       root.configApplied(key, exitCode === 0)
       if (exitCode !== 0)
-        console.warn("bkg-changer: could not set " + key + " (exit " + exitCode + ")")
+        console.warn("bg-pasticcio: could not set " + key + " (exit " + exitCode + ")")
     }
   }
 
@@ -239,7 +239,7 @@ Item {
   // ------------------------------------------------------------------- ipc
 
   IpcHandler {
-    target: "bkgchanger"
+    target: "bgpasticcio"
 
     // Fetch a fresh image now and restart the clock from this moment.
     function next(): string {
@@ -280,7 +280,7 @@ Item {
   }
 
   Component.onCompleted: {
-    console.log("bkg-changer: service loaded, worker=" + root.workerPath)
+    console.log("bg-pasticcio: service loaded, worker=" + root.workerPath)
     root.refreshStatus()
   }
 }

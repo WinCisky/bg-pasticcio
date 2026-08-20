@@ -1,11 +1,11 @@
-# Background Changer
+# bg-pasticcio
 
 An Omarchy 4 ("Quattro") shell plugin that changes the desktop background on a
 timer, pulling fresh images from an HTTP endpoint you configure and keeping the
 last few locally so rotation keeps working with no internet.
 
 - Changes the background immediately when installed, then every `N` minutes.
-- Works with no configuration: it ships pointing at `https://bkg.ssimo.dev`,
+- Works with no configuration: it ships pointing at `https://bg.ssimo.dev`,
   a CC0 wallpaper feed. Point it anywhere else from the panel.
 - An endpoint returns JSON like `{"url": "https://.../image.jpg"}`, optionally
   with a title, who made it, and its licence — all shown in the panel.
@@ -23,8 +23,8 @@ last few locally so rotation keeps working with no internet.
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/WinCisky/omarchy-bkg-changer.git --enable --yes
-omarchy bar put ssimo.bkg-changer --after omarchy.clock
+omarchy plugin add https://github.com/WinCisky/bg-pasticcio.git --enable --yes
+omarchy bar put ssimo.bg-pasticcio --after omarchy.clock
 ```
 
 From a local checkout (`omarchy plugin add` clones, and a filesystem path is a
@@ -33,15 +33,15 @@ valid git URL):
 ```sh
 git init && git add -A && git commit -m "init"
 omarchy plugin add "$PWD" --enable --yes
-omarchy bar put ssimo.bkg-changer --after omarchy.clock
+omarchy bar put ssimo.bg-pasticcio --after omarchy.clock
 ```
 
 Or fully manually:
 
 ```sh
-cp -r . ~/.config/omarchy/plugins/ssimo.bkg-changer
+cp -r . ~/.config/omarchy/plugins/ssimo.bg-pasticcio
 omarchy-shell shell rescanPlugins
-omarchy plugin enable ssimo.bkg-changer --after omarchy.clock
+omarchy plugin enable ssimo.bg-pasticcio --after omarchy.clock
 ```
 
 The background changes within a second or two of enabling, using the default
@@ -55,9 +55,36 @@ rather than in the bar layout, and enabling it again is a no-op. Move it across
 once:
 
 ```sh
-omarchy plugin disable ssimo.bkg-changer
-omarchy plugin enable ssimo.bkg-changer --after omarchy.clock
+omarchy plugin disable ssimo.bg-pasticcio
+omarchy plugin enable ssimo.bg-pasticcio --after omarchy.clock
 ```
+
+### Upgrading from `omarchy-bkg-changer`
+
+The plugin was renamed, and with it the plugin id, the worker, the IPC target
+and every directory it owns. Nothing migrates automatically. Remove the old
+plugin first, since the two ids install side by side:
+
+```sh
+omarchy plugin remove ssimo.bkg-changer
+```
+
+Then, to keep your liked images, blocklist and settings, move them across
+before installing the new one:
+
+```sh
+mv ~/.config/omarchy-bkg-changer       ~/.config/bg-pasticcio
+mv ~/.local/share/omarchy-bkg-changer  ~/.local/share/bg-pasticcio
+mv ~/.local/state/omarchy-bkg-changer  ~/.local/state/bg-pasticcio
+mv ~/.local/state/bg-pasticcio/bkg-changer.log \
+   ~/.local/state/bg-pasticcio/bg-pasticcio.log
+```
+
+Skipping this loses nothing — the old directories stay where they are — but
+the plugin starts from an empty pool with default settings.
+
+The pause toggle also changed name, from `bkg-changer-off` to
+`bg-pasticcio-off`. If rotation was paused, pause it again from the panel.
 
 ## The panel
 
@@ -69,9 +96,9 @@ middle-click to rotate to the next cached one. Inside:
 | **Keep** (`f`) | Moves the image on screen into `liked/`, where pruning can never reach it. It stays in the rotation. |
 | **Not this** (`d`, or `x`) | Deletes the image, records it so it is never shown again, and fetches a replacement immediately. |
 | **Next** (`n`) | Fetches a fresh image now and restarts the clock. |
-| **Endpoint** | Writes `BG_ENDPOINT`. Enter saves, Escape reverts. Empty means "only rotate what is already downloaded". Defaults to `https://bkg.ssimo.dev`. |
+| **Endpoint** | Writes `BG_ENDPOINT`. Enter saves, Escape reverts. Empty means "only rotate what is already downloaded". Defaults to `https://bg.ssimo.dev`. |
 | **Change every / Keep** | `BG_INTERVAL_MINUTES` and `BG_KEEP_IMAGES`. The interval re-arms without a restart. |
-| **Pause rotation** (`p`) | The same flag as `omarchy-toggle bkg-changer-off`. |
+| **Pause rotation** (`p`) | The same flag as `omarchy-toggle bg-pasticcio-off`. |
 
 When the endpoint sends them, the title and a `by creator · licence · source`
 line sit under the preview. The licence and source are clickable when the
@@ -85,12 +112,12 @@ wallpaper the plugin did not download is not one it will offer to rate.
 The panel can also be summoned from a keybinding:
 
 ```sh
-omarchy-shell shell toggle ssimo.bkg-changer
+omarchy-shell shell toggle ssimo.bg-pasticcio
 ```
 
 ## Endpoint response
 
-The default endpoint, `https://bkg.ssimo.dev`, serves CC0 photography with full
+The default endpoint, `https://bg.ssimo.dev`, serves CC0 photography with full
 credits. Any endpoint works as long as it answers with JSON: only `url` is
 required, everything else is optional, and anything not listed here is
 ignored:
@@ -120,12 +147,12 @@ picture that came out of the cache days later.
 
 ## Configuration
 
-`~/.config/omarchy-bkg-changer/config.env`, created with defaults on first run.
+`~/.config/bg-pasticcio/config.env`, created with defaults on first run.
 The panel edits this file for you; editing it by hand works just as well.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `BG_ENDPOINT` | `https://bkg.ssimo.dev` | JSON endpoint. Empty = rotate the local cache only. |
+| `BG_ENDPOINT` | `https://bg.ssimo.dev` | JSON endpoint. Empty = rotate the local cache only. |
 | `BG_INTERVAL_MINUTES` | `60` | How often to change the background. |
 | `BG_KEEP_IMAGES` | `10` | How many downloaded images to keep. Kept images are not counted. |
 | `BG_TIMEOUT_SECONDS` | `20` | Per-request network timeout. |
@@ -140,20 +167,20 @@ worker on its next run.
 ## Commands
 
 ```sh
-omarchy-shell bkgchanger next      # fetch a fresh image now, restart the clock
-omarchy-shell bkgchanger rotate    # next cached image, no network
-omarchy-shell bkgchanger like      # keep the image on screen for good
-omarchy-shell bkgchanger dislike   # discard it, and never show it again
-omarchy-shell bkgchanger status    # scheduler and worker state as JSON
+omarchy-shell bgpasticcio next      # fetch a fresh image now, restart the clock
+omarchy-shell bgpasticcio rotate    # next cached image, no network
+omarchy-shell bgpasticcio like      # keep the image on screen for good
+omarchy-shell bgpasticcio dislike   # discard it, and never show it again
+omarchy-shell bgpasticcio status    # scheduler and worker state as JSON
 
-omarchy-toggle bkg-changer-off     # pause rotation without disabling the plugin
+omarchy-toggle bg-pasticcio-off     # pause rotation without disabling the plugin
 ```
 
 The worker is also runnable directly, which is the fastest way to see what is
 going wrong:
 
 ```sh
-P=~/.config/omarchy/plugins/ssimo.bkg-changer/bin/bkg-changer
+P=~/.config/omarchy/plugins/ssimo.bg-pasticcio/bin/bg-pasticcio
 $P run
 $P status
 $P like
@@ -165,14 +192,14 @@ $P set-config BG_ENDPOINT https://example.com/wallpaper.json
 
 - The manifest declares two kinds. `Service.qml` is the `service`: a headless
   singleton loaded by `omarchy-shell` at startup that owns the schedule and the
-  `bkgchanger` IPC target. `BarPanel.qml` is the `bar-widget`: the icon and its
+  `bgpasticcio` IPC target. `BarPanel.qml` is the `bar-widget`: the icon and its
   popup. A bar widget is built once per monitor, so the widget keeps no state —
   it calls the service, which owns the one worker process, and every copy of
   the panel therefore agrees with every other.
 - The service owns a `Timer` with `triggeredOnStart: true` (hence the immediate
   first change) and a second, single-shot timer that backs off after a failed
   run: 1, 2, 4, 8 ... minutes, capped at the normal interval.
-- `bin/bkg-changer` does all the work: fetches the JSON, extracts `.url`,
+- `bin/bg-pasticcio` does all the work: fetches the JSON, extracts `.url`,
   downloads the image, verifies the downloaded bytes really are an image (an
   HTML error page served with a `200` never becomes your wallpaper), stores it
   under a content hash, applies it, and prunes the pool. It is also the only
@@ -184,20 +211,20 @@ $P set-config BG_ENDPOINT https://example.com/wallpaper.json
   Both are checked on the next fetch, so a blocked image is rejected before it
   is downloaded when possible, and thrown away after hashing when not.
 - Runs are serialised with `flock`, so a timer tick and a manual
-  `omarchy-shell bkgchanger next` cannot race. `status` and `set-config` do not
+  `omarchy-shell bgpasticcio next` cannot race. `status` and `set-config` do not
   take the lock, so the panel stays responsive during a download.
 
 ## Files
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/omarchy-bkg-changer/config.env` | your settings |
-| `~/.local/share/omarchy-bkg-changer/images/` | the downloaded image pool, pruned to `BG_KEEP_IMAGES` |
-| `~/.local/share/omarchy-bkg-changer/liked/` | images you kept; never pruned |
-| `~/.local/state/omarchy-bkg-changer/blocklist` | `<sha256>` + source URL of every image you discarded |
+| `~/.config/bg-pasticcio/config.env` | your settings |
+| `~/.local/share/bg-pasticcio/images/` | the downloaded image pool, pruned to `BG_KEEP_IMAGES` |
+| `~/.local/share/bg-pasticcio/liked/` | images you kept; never pruned |
+| `~/.local/state/bg-pasticcio/blocklist` | `<sha256>` + source URL of every image you discarded |
 | `<image>.meta` | JSON sidecar: the endpoint's answer for that image |
-| `~/.local/state/omarchy-bkg-changer/setup-required.png` | generated "configure me" background |
-| `~/.local/state/omarchy-bkg-changer/bkg-changer.log` | one line per run, self-truncating |
+| `~/.local/state/bg-pasticcio/setup-required.png` | generated "configure me" background |
+| `~/.local/state/bg-pasticcio/bg-pasticcio.log` | one line per run, self-truncating |
 | `~/.local/state/omarchy/current/background` | Omarchy's symlink to the active image |
 
 Each image carries a `.meta` sidecar holding the sanitized endpoint answer, so
@@ -208,12 +235,12 @@ and replaced with a `.meta` when the endpoint offers the same picture again.
 
 ## Troubleshooting
 
-Check the log first: `tail ~/.local/state/omarchy-bkg-changer/bkg-changer.log`.
+Check the log first: `tail ~/.local/state/bg-pasticcio/bg-pasticcio.log`.
 
 - **Nothing happens on install** — `omarchy plugin list` should show
-  `ssimo.bkg-changer` enabled. If not: `omarchy plugin enable ssimo.bkg-changer`.
+  `ssimo.bg-pasticcio` enabled. If not: `omarchy plugin enable ssimo.bg-pasticcio`.
 - **The plugin works but there is no icon** — the widget has to be in the bar
-  layout: `omarchy bar put ssimo.bkg-changer --after omarchy.clock`.
+  layout: `omarchy bar put ssimo.bg-pasticcio --after omarchy.clock`.
 - **"Not this" says the endpoint only had that same image** — exactly that.
   Many wallpaper endpoints cache one answer for everybody for minutes or hours,
   so there is nothing else to hand out yet. The discarded image is still gone
@@ -242,16 +269,16 @@ Check the log first: `tail ~/.local/state/omarchy-bkg-changer/bkg-changer.log`.
 ## Uninstall
 
 ```sh
-omarchy plugin remove ssimo.bkg-changer
+omarchy plugin remove ssimo.bg-pasticcio
 ```
 
 The image pool, kept images, config and log are left in place on purpose.
 Remove them with:
 
 ```sh
-rm -rf ~/.config/omarchy-bkg-changer \
-       ~/.local/share/omarchy-bkg-changer \
-       ~/.local/state/omarchy-bkg-changer
+rm -rf ~/.config/bg-pasticcio \
+       ~/.local/share/bg-pasticcio \
+       ~/.local/state/bg-pasticcio
 ```
 
 Note that if the wallpaper in use came from the pool, delete it only after
