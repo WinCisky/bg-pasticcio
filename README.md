@@ -3,9 +3,8 @@
 An Omarchy 4 ("Quattro") shell plugin that changes your desktop background on a
 timer, pulling images from an HTTP JSON endpoint. An icon next to the clock
 opens a panel to switch it on, point it at a feed, and keep or discard the
-image on screen. Nothing is cached: the images you want to keep are the only ones
-that stay on disk, and they are what it rotates through when the endpoint cannot
-be reached.
+image on screen. Only the images you decide to keep are stored on disk, and they 
+are what it rotates through when the endpoint cannot be reached.
 
 It ships **off**, pointing at `https://bg.ssimo.dev` — a CC0 wallpaper
 feed. Nothing is downloaded and no wallpaper is touched until you turn on
