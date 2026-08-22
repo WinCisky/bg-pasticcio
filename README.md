@@ -17,8 +17,8 @@ back.
 ## Requirements
 
 Omarchy 4 with `omarchy-shell`. The worker uses `curl`, `jq`, `file`,
-`sha256sum`, `find` and `flock`, all present in a default Omarchy install; it
-checks for them and says so in the log if one is missing. `magick`, `fc-match`
+`sha256sum`, `find`, `flock` and `getent`, all present in a default Omarchy
+install; it checks for them and says so in the log if one is missing. `magick`, `fc-match`
 and `hyprctl` are optional and only affect the "configure me" notice
 background.
 

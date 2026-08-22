@@ -191,11 +191,21 @@ desktop and in a shell command line:
 - anything failing a check is dropped, and the panel simply omits it;
 - text fields render as plain text, never markup.
 
-Downloads: `curl` pinned to `http`/`https` including redirects (so an endpoint
-cannot bounce the fetch into `file://`), stopped at 64 MB, and URLs are
-stripped out of logged network errors because an endpoint URL can carry a
-token. Downloaded bytes are verified with `file` — an HTML error page served
-with a `200` never becomes a wallpaper.
+Downloads: `curl` pinned to `http`/`https` (so an endpoint cannot bounce the
+fetch into `file://`), stopped at 64 MB, and URLs are stripped out of logged
+network errors because an endpoint URL can carry a token. Downloaded bytes are
+verified with `file` — an HTML error page served with a `200` never becomes a
+wallpaper.
+
+Where the fetch may point is checked too, because the feed picks the image URL:
+`url_is_public` resolves the host and refuses loopback, link-local, private,
+CGNAT and multicast addresses, so a feed cannot have this machine fetch from a
+service only this machine can reach. `-L` is not used — it would connect to
+whatever the previous hop named before that check could run — so
+`curl_with_backoff` walks redirects itself (at most `MAX_REDIRECTS`) and vets
+every hop. Only `BG_ENDPOINT` itself is exempt on its first hop, since the user
+configured it and a local feed of their own is legitimate; nothing it points at
+afterwards is.
 
 ## Invariants — do not break these
 

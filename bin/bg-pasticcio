@@ -58,9 +58,13 @@ LOG_KEEP_LINES=200
 # it. Applies to the JSON answer too, which should be a few hundred bytes.
 MAX_DOWNLOAD_BYTES=$((64 * 1024 * 1024))
 
+# Redirects are followed by hand (see curl_with_backoff), so the ceiling is
+# ours to set rather than curl's.
+MAX_REDIRECTS=5
+
 # Everything the worker cannot do without. Checked once, so a missing package
 # says so in the log instead of failing somewhere deep in a pipeline.
-REQUIRED_COMMANDS=(curl jq file sha256sum flock find)
+REQUIRED_COMMANDS=(curl jq file sha256sum flock find getent)
 
 # Same extension set Omarchy itself accepts for backgrounds.
 FIND_EXT=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
@@ -545,29 +549,130 @@ discard_unkept() {
 
 # ----------------------------------------------------------------- network
 
-# curl with bounded exponential backoff. All arguments are passed through.
+# Whether an address is one a fetch is allowed to reach: not this machine, not
+# the LAN, not a link-local, CGNAT or multicast address.
+is_public_address() {
+  case "${1:-}" in
+    # IPv4: unspecified, private, loopback, link-local, CGNAT, and everything
+    # from the multicast range upwards.
+    '' | 0.* | 10.* | 127.* | 169.254.* | 192.168.*) return 1 ;;
+    172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) return 1 ;;
+    100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 1 ;;
+    22[4-9].* | 2[34][0-9].* | 25[0-5].*) return 1 ;;
+    # IPv6: unspecified, loopback, IPv4-mapped, unique-local (fc00::/7),
+    # link-local (fe80::/10), multicast (ff00::/8).
+    :: | ::1 | ::[fF][fF][fF][fF]:*) return 1 ;;
+    [fF][cCdD][0-9a-fA-F][0-9a-fA-F]:*) return 1 ;;
+    [fF][eE][89abAB][0-9a-fA-F]:*) return 1 ;;
+    [fF][fF][0-9a-fA-F][0-9a-fA-F]:*) return 1 ;;
+  esac
+  return 0
+}
+
+# The host of a URL, without userinfo, port or the brackets around a literal
+# IPv6 address. Empty for a URL that has no host at all.
+url_host() {
+  local rest=${1#*://}
+  rest=${rest%%/*}
+  rest=${rest%%\?*}
+  rest=${rest%%#*}
+  rest=${rest##*@}
+  if [[ $rest == \[*\]* ]]; then
+    rest=${rest#\[}
+    printf '%s' "${rest%%\]*}"
+    return 0
+  fi
+  printf '%s' "${rest%%:*}"
+}
+
+# The endpoint picks the image URL, and a redirect lets it pick again after the
+# first hop, so every address a hop resolves to has to be a public one.
+# Otherwise a feed could have this machine fetch from something only this
+# machine can reach — a service on loopback, a box on the LAN.
+#
+# The name is resolved here and then handed back to curl to resolve again, so a
+# DNS answer that changes between the two would still get through. Closing that
+# too would mean pinning the address curl connects to; the redirect this does
+# close is the part the endpoint controls outright.
+url_is_public() {
+  local url=$1 host addr resolved=0
+  host=$(url_host "$url")
+  if [[ -z $host ]]; then
+    log "ERROR refusing a url with no host"
+    return 1
+  fi
+  while read -r addr _; do
+    [[ -n $addr ]] || continue
+    resolved=1
+    if ! is_public_address "$addr"; then
+      log "ERROR refusing $host: it resolves to the non-public address $addr"
+      return 1
+    fi
+  done < <(getent ahosts "$host" 2>/dev/null)
+  ((resolved)) || { log "ERROR could not resolve $host"; return 1; }
+  return 0
+}
+
+# curl with bounded exponential backoff. $1 is where the body goes ("-" for
+# stdout), $2 the URL; a non-empty $3 says the URL is the one the user put in
+# config.env, which may legitimately be a private address — a local feed of
+# their own. Nothing the endpoint names afterwards gets that latitude.
+#
+# -L is deliberately not used: it would connect to whatever the previous hop
+# named before url_is_public could look at it, so the hops are walked here.
+# Returns 6 for a hop that was refused, otherwise curl's own status.
 curl_with_backoff() {
-  local attempt=1 rc delay reason
+  local out=$1 url=$2 trusted=${3:-}
+  local attempt=1 hop target next rc delay reason
   local errfile="$STATE_DIR/.curl-err.$$"
+  local body=$out spool=""
+  [[ $out == - ]] && {
+    spool="$STATE_DIR/.curl-body.$$"
+    body=$spool
+  }
+
   while :; do
-    # `&&` rather than `if`, so $? below is curl's status and not the `if`'s.
-    # Explicit protocols: an endpoint must not be able to redirect the fetch
-    # into file:// or scp://, whatever the local curl's defaults happen to be.
-    curl -fsSL \
-      --proto '=http,https' --proto-redir '=http,https' \
-      --max-filesize "$MAX_DOWNLOAD_BYTES" \
-      --max-time "$BG_TIMEOUT_SECONDS" "$@" 2>"$errfile" && {
-      rm -f -- "$errfile"
+    hop=0
+    target=$url
+    while :; do
+      if [[ -z $trusted || $hop -gt 0 ]] && ! url_is_public "$target"; then
+        rm -f -- "$errfile" "$spool"
+        return 6
+      fi
+      # Explicit protocols: an endpoint must not be able to send the fetch into
+      # file:// or scp://, whatever the local curl's defaults happen to be.
+      # `%{stderr}` puts the next location where it cannot be mistaken for part
+      # of the body; on a final response it writes nothing at all.
+      curl -fsS \
+        --proto '=http,https' \
+        --max-filesize "$MAX_DOWNLOAD_BYTES" \
+        --max-time "$BG_TIMEOUT_SECONDS" \
+        -w '%{stderr}%{redirect_url}' \
+        -o "$body" -- "$target" 2>"$errfile"
+      rc=$?
+      ((rc == 0)) || break
+      next=$(tr -d '\r\n' <"$errfile" 2>/dev/null)
+      [[ -n $next ]] || break
+      if ((++hop > MAX_REDIRECTS)); then
+        log "ERROR more than $MAX_REDIRECTS redirects, giving up"
+        rm -f -- "$errfile" "$spool"
+        return 47
+      fi
+      target=$next
+    done
+
+    if ((rc == 0)); then
+      [[ -n $spool ]] && cat -- "$spool"
+      rm -f -- "$errfile" "$spool"
       return 0
-    }
-    rc=$?
+    fi
     # curl names the URL it failed on, and an endpoint URL can carry a token,
     # so keep the host and the reason out of the log's reach.
     reason=$(tail -n1 -- "$errfile" 2>/dev/null | tr -d '\r' | sed -E 's#[a-z]+://[^ ]*#<url>#g')
     : "${reason:=curl exit $rc}"
     if ((attempt >= BG_MAX_RETRIES)); then
       log "WARN gave up after $attempt attempt(s): $reason"
-      rm -f -- "$errfile"
+      rm -f -- "$errfile" "$spool"
       return "$rc"
     fi
     delay=$((BG_RETRY_BASE_SECONDS * (1 << (attempt - 1))))
@@ -650,7 +755,7 @@ read_meta() {
 # command substitution, and a subshell cannot hand anything back any other way.
 resolve_endpoint_meta() {
   local body url meta
-  body=$(curl_with_backoff -- "$BG_ENDPOINT") || return 1
+  body=$(curl_with_backoff - "$BG_ENDPOINT" trusted) || return 1
 
   url=$(printf '%s' "$body" | jq -er '.url' 2>/dev/null)
   if [[ -z $url || $url == "null" ]]; then
@@ -661,6 +766,9 @@ resolve_endpoint_meta() {
     log "ERROR refusing non-http(s) image url: $url"
     return 1
   fi
+  # The endpoint chose this URL, so it has to point at the public internet and
+  # not at something reachable only from here.
+  url_is_public "$url" || return 1
   if is_blocked_url "$url"; then
     log "endpoint offered a disliked image again (by url)"
     return 2
@@ -691,7 +799,7 @@ download_image() {
   local tmp="$IMAGE_DIR/.download.$$"
   rm -f -- "$tmp"
 
-  if ! curl_with_backoff -o "$tmp" -- "$url"; then
+  if ! curl_with_backoff "$tmp" "$url"; then
     rm -f -- "$tmp"
     return 1
   fi
