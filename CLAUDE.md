@@ -61,6 +61,10 @@ code.
   refreshing the panel must not queue behind a download.
 - Status polling runs at 5 s only while `uiWatchers > 0`; panels call
   `watch()`/`unwatch()` on open/close, so nothing polls when nobody is looking.
+- `setConfig` starts `configProc` with the key only, then writes the value plus
+  a newline on `onStarted` and clears the property that held it. A value
+  carrying a newline is refused before the worker is started: the worker reads
+  one line, and would otherwise save a pasted value cut in half.
 - `IpcHandler` target `bgpasticcio` exposes `next`, `rotate`, `like`,
   `dislike`, `enable`, `disable`, `restore`, `status`. Each returns
   `"running"` or `"busy"`.
@@ -105,7 +109,7 @@ background or the setup notice is not something to rate.
 | `dislike` | yes | Delete it, blocklist hash + source URL, fetch a replacement. |
 | `enable` / `disable` | yes | Flip `BG_ENABLED`; `disable` also restores the original wallpaper. |
 | `restore` | yes | Put the pre-first-change wallpaper back, leave the switch alone. |
-| `set-config KEY VALUE` | its own | Only writer of `config.env`. Never touches the images. |
+| `set-config KEY [VALUE]` | its own | Only writer of `config.env`. Never touches the images. Without `VALUE` the value is read as one line on stdin — how the panel sends it. Refused, rather than read, when stdin is a terminal, so a forgotten argument cannot silently blank the endpoint. |
 | `status` | **no** | JSON: config, kept/blocked counts, current image, last result. |
 | `interval` | **no** | Prints `BG_INTERVAL_MINUTES`. |
 
@@ -165,18 +169,18 @@ wallpaper. `disable` does both.
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/bg-pasticcio/config.env` | settings |
+| `~/.config/bg-pasticcio/config.env` | settings. 0600, in a 0700 directory: it holds `BG_ENDPOINT` |
 | `~/.local/share/bg-pasticcio/images/` | at most one file: the downloaded image on screen |
 | `~/.local/share/bg-pasticcio/liked/` | kept images; the only durable collection, never deleted from |
 | `~/.local/state/bg-pasticcio/original-background` | wallpaper from before the first change |
-| `~/.local/state/bg-pasticcio/blocklist` | `<sha256>` + source URL per discarded image |
+| `~/.local/state/bg-pasticcio/blocklist` | `<sha256>` + source URL per discarded image. 0600 |
 | `~/.local/state/bg-pasticcio/last` | tab-separated epoch, result, message — feeds `status` |
 | `~/.local/state/bg-pasticcio/lock` | `flock` target for image/wallpaper commands |
 | `~/.config/bg-pasticcio/.config-lock` | `flock` target for `set-config` only |
 | `~/.local/state/bg-pasticcio/setup-required.png` | generated "configure me" background |
 | `~/.local/state/bg-pasticcio/bg-pasticcio.log` | one line per run; truncated to 200 lines past 256 KB |
 | `.download.<pid>`, `.curl-body.<pid>`, `.curl-err.<pid>`, `*.tmp.<pid>` | scratch. Removed by the worker's `EXIT`/`INT`/`TERM` trap; a run killed outright leaves them, so `sweep_stale_temp_files` deletes any older than an hour, under the lock |
-| `<image>.meta` | JSON sidecar: the sanitized endpoint answer for that image |
+| `<image>.meta` | JSON sidecar: the sanitized endpoint answer for that image. 0600 |
 | `<image>.src` | legacy sidecar, URL only; still read, upgraded to `.meta` when seen again |
 | `~/.local/state/omarchy/current/background` | Omarchy's symlink to the active image |
 
@@ -212,10 +216,33 @@ desktop and in a shell command line:
 Downloads: `curl` pinned to `http`/`https` (so an endpoint cannot bounce the
 fetch into `file://`), stopped at 64 MB — 256 KB for the JSON answer, which is
 read into a shell variable and so gets a ceiling of its own rather than the
-wallpaper's — and URLs are stripped out of logged
-network errors because an endpoint URL can carry a token. Downloaded bytes are
-verified with `file` — an HTML error page served with a `200` never becomes a
-wallpaper.
+wallpaper's. Downloaded bytes are verified with `file` — an HTML error page
+served with a `200` never becomes a wallpaper.
+
+An endpoint URL can carry a token, so it is kept out of everywhere it would
+otherwise end up in the clear:
+
+- **Not in the log.** URLs are stripped from logged network errors, and no
+  message that refuses a URL prints it.
+- **Not in `argv`.** `/proc/<pid>/cmdline` is readable by every local user
+  unless `/proc` was mounted with `hidepid`, so neither process that handles the
+  endpoint puts it there. `curl` is given the URL on stdin through its
+  config-file syntax (`-K -`); `--resolve` and the rest stay in `argv`, since
+  they give away a host and never a secret. `set-config` takes the key as an
+  argument and the value as a line on stdin, written by `configProc.onStarted`
+  — the newline is what ends the worker's read, so stdin never has to be closed
+  and the write cannot race the close. Typed by hand, `set-config KEY VALUE`
+  still works and is still `argv`; that is the caller's choice to make.
+- **Not world-readable on disk.** `config.env` is 0600 and its directory 0700,
+  set on creation and re-applied on every run so a file written before this
+  existed is narrowed too. Same for `blocklist` and the `.meta` sidecars, which
+  hold image URLs that can be presigned. The images themselves stay 0644.
+
+`-K -` quotes with `"` and `\`, so `url_is_safe` gates every URL before curl is
+handed it — `BG_ENDPOINT` (which `config_value_valid` only checks when the panel
+writes it, not when the file is edited by hand), the image URL the endpoint
+chose, and every redirect target. The character set is the union of the two
+already in use, and it cannot express either quoting character.
 
 Where the fetch may point is checked too, because the feed picks the image URL:
 `url_is_public` resolves the host and refuses loopback, link-local, private,

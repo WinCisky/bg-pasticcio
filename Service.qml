@@ -284,19 +284,44 @@ Item {
   signal configApplied(string key, bool ok)
 
   property string pendingConfigKey: ""
+  // Held only between starting the worker and writing the value to it, then
+  // cleared: BG_ENDPOINT can carry a token and this object is reachable from
+  // every panel in the bar.
+  property string pendingConfigValue: ""
   readonly property bool savingConfig: configProc.running
 
   function setConfig(key, value) {
     if (configProc.running)
       return false
+    var text = String(value)
+    // The worker reads one line, and refuses a value carrying a newline in any
+    // case. Caught here so a pasted value is rejected rather than silently
+    // saved cut in half.
+    if (text.indexOf("\n") >= 0 || text.indexOf("\r") >= 0)
+      return false
     root.pendingConfigKey = String(key)
-    configProc.command = [root.workerPath, "set-config", String(key), String(value)]
+    root.pendingConfigValue = text
+    // Key in the argument list, value on stdin. An argument is visible in
+    // /proc/<pid>/cmdline to every local user unless /proc was mounted with
+    // hidepid, and the endpoint is the one setting here that can be a secret.
+    configProc.command = [root.workerPath, "set-config", String(key)]
+    configProc.stdinEnabled = true
     configProc.running = true
     return true
   }
 
   Process {
     id: configProc
+
+    // On started rather than straight after `running = true`, so there is
+    // certainly a process to write to. The newline is what ends the worker's
+    // read, so stdin never has to be closed for it to get on with it — and not
+    // closing it here is what keeps the write from racing the close.
+    onStarted: {
+      configProc.write(root.pendingConfigValue + "\n")
+      root.pendingConfigValue = ""
+    }
+
     onExited: function (exitCode) {
       var key = root.pendingConfigKey
       root.pendingConfigKey = ""

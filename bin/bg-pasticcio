@@ -16,7 +16,9 @@
 #   enable                allow the plugin to change the background
 #   disable               stop it, and put the original background back
 #   restore               put the background from before the first change back
-#   set-config KEY VALUE  change one setting in config.env
+#   set-config KEY VALUE  change one setting in config.env (VALUE may instead
+#                         be given as a line on stdin, which keeps a secret out
+#                         of the process's command line)
 #   status                print JSON describing config, images and last run
 #   interval              print the configured interval in minutes
 #
@@ -150,7 +152,13 @@ record_result() {
 
 # ------------------------------------------------------------------- config
 
-write_default_config() {
+# The endpoint can carry a token — that is why it is kept out of the log — so
+# the file holding it is created owner-only, in a subshell so the umask goes
+# back afterwards and nothing else picks up the narrower mode. Set on creation
+# rather than chmod'd after, so there is no moment where the file exists and is
+# readable by anyone else.
+write_default_config() (
+  umask 077
   # Two parts, because the endpoint is written from $DEFAULT_ENDPOINT while the
   # rest is a quoted heredoc: one place to change the default, and no risk of
   # the shell expanding something in the comments.
@@ -189,13 +197,20 @@ BG_RETRY_BASE_SECONDS=2
 # back the same one, so this gives up quickly and shows a kept image instead.
 BG_BLOCKED_RETRIES=3
 EOF
-}
+)
 
 CONFIG_KEYS=(BG_ENABLED BG_ENDPOINT BG_INTERVAL_MINUTES
   BG_TIMEOUT_SECONDS BG_MAX_RETRIES BG_RETRY_BASE_SECONDS BG_BLOCKED_RETRIES)
 
 load_config() {
   mkdir -p "$CONFIG_DIR" "$IMAGE_DIR" "$LIKED_DIR" "$STATE_DIR" 2>/dev/null
+
+  # Narrowed on every run, not only at creation: a config written before this
+  # existed is already 0644, and so is a blocklist — which records the source
+  # URL of every image discarded, and those can be presigned.
+  chmod 0700 -- "$CONFIG_DIR" 2>/dev/null
+  [[ -f $CONFIG_FILE ]] && chmod 0600 -- "$CONFIG_FILE" 2>/dev/null
+  [[ -f $BLOCKLIST_FILE ]] && chmod 0600 -- "$BLOCKLIST_FILE" 2>/dev/null
 
   # Anything already in the environment wins over the config file, which makes
   # `BG_ENDPOINT=... bg-pasticcio run` usable for testing without editing config.
@@ -471,6 +486,9 @@ block_image() {
   local hash=$1 url=${2:-}
   is_blocked_hash "$hash" && return 0
   printf '%s\t%s\t%s\n' "$hash" "$url" "$(date +%s)" >>"$BLOCKLIST_FILE" 2>/dev/null
+  # Source URLs, so owner-only like the config. Cheap enough to repeat: the
+  # append above creates the file the first time round.
+  chmod 0600 -- "$BLOCKLIST_FILE" 2>/dev/null
   return 0
 }
 
@@ -661,6 +679,19 @@ url_port() {
   fi
 }
 
+# What a URL may be built from before curl is allowed near it. The URL reaches
+# curl through its config-file syntax now (see curl_with_backoff), which quotes
+# with " and \, so a URL carrying either could add options of its own — and the
+# endpoint picks the image URL, and through a redirect every hop after the
+# first. The set is the union of the two already in use: what
+# config_value_valid accepts for BG_ENDPOINT, and what sanitize_meta accepts
+# for a credit link.
+URL_SAFE_RE='^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'
+
+url_is_safe() {
+  [[ ${1:-} =~ $URL_SAFE_RE ]]
+}
+
 # The endpoint picks the image URL, and a redirect lets it pick again after the
 # first hop, so every address a hop resolves to has to be a public one.
 # Otherwise a feed could have this machine fetch from something only this
@@ -737,6 +768,14 @@ curl_with_backoff() {
     target=$url
     while :; do
       pin=()
+      # Before anything else: BG_ENDPOINT is validated when the panel writes it
+      # but not when the file is edited by hand, and a redirect target is
+      # whatever a server said. The message names no URL — it can carry a token.
+      if ! url_is_safe "$target"; then
+        log "ERROR refusing a url that is not a plain http(s) url"
+        rm -f -- "$errfile" "$spool"
+        return 6
+      fi
       if [[ -z $trusted || $hop -gt 0 ]]; then
         if ! url_is_public "$target"; then
           rm -f -- "$errfile" "$spool"
@@ -748,13 +787,17 @@ curl_with_backoff() {
       # file:// or scp://, whatever the local curl's defaults happen to be.
       # `%{stderr}` puts the next location where it cannot be mistaken for part
       # of the body; on a final response it writes nothing at all.
-      curl -fsS \
+      # The URL goes in on stdin, through curl's config-file syntax, rather than
+      # in argv: it can carry a token, and /proc/<pid>/cmdline is readable by
+      # every local user unless /proc was mounted with hidepid. Everything else
+      # stays in argv — the pinned addresses give away a host, never a secret.
+      printf 'url = "%s"\n' "$target" | curl -fsS \
         --proto '=http,https' \
         ${pin[@]+"${pin[@]}"} \
         --max-filesize "$ceiling" \
         --max-time "$BG_TIMEOUT_SECONDS" \
         -w '%{stderr}%{redirect_url}' \
-        -o "$body" -- "$target" 2>"$errfile"
+        -o "$body" -K - 2>"$errfile"
       rc=$?
       ((rc == 0)) || break
       next=$(tr -d '\r\n' <"$errfile" 2>/dev/null)
@@ -833,6 +876,8 @@ write_meta() {
     jq -c --arg url "$url" '. + {url: $url}' 2>/dev/null)
   [[ -n $merged ]] || merged=$(jq -cn --arg url "$url" '{url: $url}')
   printf '%s\n' "$merged" >"$target.meta" 2>/dev/null
+  # Holds the image URL, which can be presigned; the image itself stays 0644.
+  chmod 0600 -- "$target.meta" 2>/dev/null
   return 0
 }
 
@@ -868,8 +913,10 @@ resolve_endpoint_meta() {
     log "ERROR endpoint response has no usable .url field"
     return 1
   fi
-  if [[ $url != http://* && $url != https://* ]]; then
-    log "ERROR refusing non-http(s) image url: $url"
+  if ! url_is_safe "$url"; then
+    # The URL is not in the message: the endpoint chose it, and it can carry a
+    # token of its own.
+    log "ERROR refusing an image url that is not a plain http(s) url"
     return 1
   fi
   # The endpoint chose this URL, so it has to point at the public internet and
@@ -1238,8 +1285,30 @@ cmd_disable() {
   return 0
 }
 
+# The value is $2 when there is one, and otherwise a line on stdin. The panel
+# uses the second form: BG_ENDPOINT can carry a token, and an argument is
+# visible in /proc/<pid>/cmdline to every local user for as long as the process
+# lives. By hand, `set-config KEY VALUE` still works as it always did — and an
+# empty endpoint still has to be asked for explicitly, as `set-config
+# BG_ENDPOINT ""`, rather than by leaving the argument off.
 cmd_set_config() {
-  local key=${1:-} value=${2-} known=0 candidate
+  local key=${1:-} value="" known=0 candidate
+  if (($# >= 2)); then
+    value=$2
+  elif [[ -t 0 ]]; then
+    log "ERROR no value given for ${key:-<none>}, and stdin is a terminal"
+    return 1
+  else
+    # One line, because config_value_safe refuses a value containing a newline
+    # anyway. A value sent without a trailing newline is fine — read reports EOF
+    # and still hands it over — but nothing at all is not: blanking the endpoint
+    # is asked for as `set-config BG_ENDPOINT ""`, never by saying nothing.
+    if ! IFS= read -r value && [[ -z $value ]]; then
+      log "ERROR no value for ${key:-<none>} on stdin"
+      return 1
+    fi
+  fi
+
   for candidate in "${CONFIG_KEYS[@]}"; do
     [[ $candidate == "$key" ]] && known=1 && break
   done
@@ -1274,7 +1343,9 @@ cmd_set_config() {
   [[ -f $CONFIG_FILE ]] || write_default_config
 
   local tmp="$CONFIG_DIR/.config.env.$$" replaced=0 line
-  : >"$tmp" 2>/dev/null || {
+  # The mv below makes this file the config, so it is created with the config's
+  # mode rather than the umask's.
+  (umask 077; : >"$tmp") 2>/dev/null || {
     log "ERROR cannot write $tmp"
     return 1
   }
@@ -1370,8 +1441,14 @@ main() {
       ;;
     set-config)
       # Touches config.env only, never the images, so it must not queue behind
-      # a download that can take a minute.
-      cmd_set_config "${2:-}" "${3-}"
+      # a download that can take a minute. The value is forwarded only when one
+      # was actually given, so cmd_set_config can tell "no value, read stdin"
+      # from an explicitly empty one.
+      if (($# >= 3)); then
+        cmd_set_config "${2:-}" "$3"
+      else
+        cmd_set_config "${2:-}"
+      fi
       return $?
       ;;
   esac
@@ -1401,7 +1478,7 @@ main() {
     disable) cmd_disable ;;
     restore) cmd_restore ;;
     *)
-      printf 'Usage: %s [run|next|like|dislike|enable|disable|restore|set-config KEY VALUE|status|interval]\n' \
+      printf 'Usage: %s [run|next|like|dislike|enable|disable|restore|set-config KEY [VALUE, else read from stdin]|status|interval]\n' \
         "${0##*/}" >&2
       return 2
       ;;
