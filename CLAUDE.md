@@ -30,10 +30,19 @@ code.
 
 ### Service.qml
 
-- `FileView` on `config.env` with `watchChanges`, plus a 30 s re-read timer.
-  The timer is not redundant: `watchChanges` misses a file replaced by rename
-  (what `sed -i` and most editors do) and cannot watch a file that does not
-  exist yet. Only two keys are parsed here — `BG_ENABLED` and
+- `config.env` is read through `configReader`, a `Process` running
+  `head -c 65536`, on a 30 s timer and after every command that writes the file.
+  The cap is the point: `config.env` is hand-editable, this service outlives the
+  session, and a `FileView` would pull whatever it found into the shell whole,
+  every 30 s. Reading past the cap fires a one-shot `console.warn` (measured on
+  `data.byteLength`, not on the string — one em dash and a full read looks short
+  of the cap). A read requested while one is in flight sets
+  `configReloadPending` rather than being dropped: the read after `enable` is
+  what starts the schedule.
+- Polled rather than watched, deliberately. A watch has to keep the file loaded
+  to notice it change — the read just capped — and misses a file replaced by
+  rename anyway, which is what `sed -i`, most editors, and the worker's own
+  `set-config` all do. Only two keys are parsed here — `BG_ENABLED` and
   `BG_INTERVAL_MINUTES`; the worker is the source of truth for the rest.
 - `cycleTimer` — `running: root.rotationOn`, so an installed-but-untouched
   plugin has **no schedule at all**. Deliberately without `triggeredOnStart`:
@@ -96,13 +105,20 @@ background or the setup notice is not something to rate.
 | `dislike` | yes | Delete it, blocklist hash + source URL, fetch a replacement. |
 | `enable` / `disable` | yes | Flip `BG_ENABLED`; `disable` also restores the original wallpaper. |
 | `restore` | yes | Put the pre-first-change wallpaper back, leave the switch alone. |
-| `set-config KEY VALUE` | **no** | Only writer of `config.env`. Never touches the images. |
+| `set-config KEY VALUE` | its own | Only writer of `config.env`. Never touches the images. |
 | `status` | **no** | JSON: config, kept/blocked counts, current image, last result. |
 | `interval` | **no** | Prints `BG_INTERVAL_MINUTES`. |
 
-`status` and `set-config` skip `flock` so the panel stays responsive during a
-download. Everything else serialises through `$STATE_DIR/lock`, so a timer tick
-and a manual IPC call cannot race.
+`status` and `set-config` never take `$STATE_DIR/lock`, so the panel stays
+responsive during a download. Everything else serialises through it, and a timer
+tick and a manual IPC call cannot race.
+
+`set-config` does take a second, much shorter lock of its own,
+`$CONFIG_DIR/.config-lock`, because it reads the whole file and moves a new one
+over it: `enable` writing from inside the worker's lock while the panel saves an
+interval from outside it used to throw one of the two changes away. Order is
+always worker lock first, config lock second, so the pair cannot deadlock. Five
+seconds and it gives up rather than making the panel wait.
 
 ### Run path
 
@@ -155,9 +171,11 @@ wallpaper. `disable` does both.
 | `~/.local/state/bg-pasticcio/original-background` | wallpaper from before the first change |
 | `~/.local/state/bg-pasticcio/blocklist` | `<sha256>` + source URL per discarded image |
 | `~/.local/state/bg-pasticcio/last` | tab-separated epoch, result, message — feeds `status` |
-| `~/.local/state/bg-pasticcio/lock` | `flock` target |
+| `~/.local/state/bg-pasticcio/lock` | `flock` target for image/wallpaper commands |
+| `~/.config/bg-pasticcio/.config-lock` | `flock` target for `set-config` only |
 | `~/.local/state/bg-pasticcio/setup-required.png` | generated "configure me" background |
 | `~/.local/state/bg-pasticcio/bg-pasticcio.log` | one line per run; truncated to 200 lines past 256 KB |
+| `.download.<pid>`, `.curl-body.<pid>`, `.curl-err.<pid>`, `*.tmp.<pid>` | scratch. Removed by the worker's `EXIT`/`INT`/`TERM` trap; a run killed outright leaves them, so `sweep_stale_temp_files` deletes any older than an hour, under the lock |
 | `<image>.meta` | JSON sidecar: the sanitized endpoint answer for that image |
 | `<image>.src` | legacy sidecar, URL only; still read, upgraded to `.meta` when seen again |
 | `~/.local/state/omarchy/current/background` | Omarchy's symlink to the active image |
@@ -192,7 +210,9 @@ desktop and in a shell command line:
 - text fields render as plain text, never markup.
 
 Downloads: `curl` pinned to `http`/`https` (so an endpoint cannot bounce the
-fetch into `file://`), stopped at 64 MB, and URLs are stripped out of logged
+fetch into `file://`), stopped at 64 MB — 256 KB for the JSON answer, which is
+read into a shell variable and so gets a ceiling of its own rather than the
+wallpaper's — and URLs are stripped out of logged
 network errors because an endpoint URL can carry a token. Downloaded bytes are
 verified with `file` — an HTML error page served with a `200` never becomes a
 wallpaper.
@@ -224,11 +244,19 @@ their own is legitimate; nothing it points at afterwards is.
    being avoided.
 5. **The panel stores no state.** Anything remembered belongs in the service or
    in `status`.
-6. **Only image/wallpaper commands take the lock.** `status` and `set-config`
-   must stay lock-free.
+6. **Only image/wallpaper commands take `$STATE_DIR/lock`.** `status` takes no
+   lock at all; `set-config` takes only its own, so neither can end up waiting
+   on a download.
 7. **`status` is the single read model** for the UI: add a field there rather
    than shelling out from QML.
-8. **At most one downloaded image exists at a time.** `images/` holds the file
+8. **Paths are canonical before they are compared.** `CONFIG_DIR`, `DATA_DIR`,
+   `STATE_DIR` and `OMARCHY_STATE` go through `canonical_path` at the top of the
+   worker, because everything they build is matched against the background
+   symlink after `readlink -f` resolved it. Leave one unresolved and a symlinked
+   `~/.local/share` makes every image of ours read as foreign: nothing can be
+   kept, `discard_unkept` deletes the wallpaper on screen, and the background
+   written down as "the one from before" is one of ours.
+9. **At most one downloaded image exists at a time.** `images/` holds the file
    on screen and nothing else; `discard_unkept` in `main` enforces it after
    every locked command. `liked/` is the only durable collection, and nothing
    in the worker deletes from it except an explicit `dislike`.
@@ -254,6 +282,7 @@ Common failures, all visible in the log:
 | `downloaded content is not a supported image` | Not JPEG/PNG/WebP/GIF/BMP — usually an error page or a login redirect. |
 | `another run is in progress, skipping` | `flock` did its job. Not an error. |
 | Black "configure an endpoint" background | `BG_ENDPOINT` blank and `liked/` empty. Rendered with ImageMagick at the largest monitor's size (`hyprctl`), in `fc-match sans-serif`. Without `magick` the worker logs and leaves the background alone. |
+| `config.env is larger than 65536 bytes` | Only the first 64 KiB is read; keys past it are ignored. The file grew — the worker's own is ~1.2 KB. |
 | Buttons greyed out | Plugin off, worker busy, or the wallpaper did not come from this plugin. |
 | Background never changes offline | Nothing kept yet — offline rotation only has `liked/` to work with. |
 

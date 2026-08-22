@@ -73,25 +73,76 @@ Item {
     }
   }
 
-  FileView {
-    id: configFile
-    path: root.configPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.applyConfigText(text())
-    onLoadFailed: root.applyConfigText("")
-    onFileChanged: reload()
+  // config.env is a file a person edits, so its size is not this service's to
+  // assume: a stray `>>`, a mis-aimed redirect, a paste that went wrong can all
+  // leave a file far bigger than the handful of lines expected here. A FileView
+  // would hand back whatever it found, whole — and this service is long-lived
+  // and re-reads on a timer, so that would be an unbounded allocation repeated
+  // every 30 s. Bound the read at the source instead: only the capped prefix is
+  // ever parsed, and nothing larger is held even briefly.
+  //
+  // 64 KiB is ~40x the config the worker writes, and both keys read here sit in
+  // its first lines, so the cap cannot cut off a file this plugin produced.
+  readonly property int configReadLimit: 65536
+  property bool configTruncated: false
+
+  // A re-read that arrives while one is in flight is remembered rather than
+  // dropped: the read after `enable` is what starts the schedule, and it must
+  // not be the one that loses a race with the 30 s poll.
+  property bool configReloadPending: false
+
+  function reloadConfig() {
+    if (configReader.running) {
+      root.configReloadPending = true
+      return
+    }
+    root.configReloadPending = false
+    configReader.command = ["head", "-c", String(root.configReadLimit),
+                            "--", root.configPath]
+    configReader.running = true
   }
 
-  // watchChanges misses the file being replaced by a rename (which is what
-  // `sed -i` and most editors do) and cannot watch a config that does not
-  // exist yet — the worker creates it on its first run. A cheap re-read closes
-  // both gaps; applyConfigText only reacts when the value actually changed.
+  Process {
+    id: configReader
+    onExited: if (root.configReloadPending) root.reloadConfig()
+    // Collected and dropped: before the worker's first run there is no config
+    // to read, and "head: cannot open" every 30 s is not worth logging. This is
+    // what printErrors: false bought on the FileView this replaced.
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // No config yet, or one that could not be read, reads as empty — which
+        // parses as the switch being off, the safe way to be wrong.
+        var body = String(text || "")
+        // Measured on the bytes, not the string: the cap head was given is in
+        // bytes, and one em dash in a comment is enough to make a full read
+        // look short of it.
+        var truncated = (data ? data.byteLength : 0) >= root.configReadLimit
+        if (truncated !== root.configTruncated) {
+          root.configTruncated = truncated
+          if (truncated)
+            console.warn("bg-pasticcio: " + root.configPath + " is larger than "
+                         + root.configReadLimit + " bytes; only that much is read,"
+                         + " settings past it are ignored")
+        }
+        root.applyConfigText(body)
+      }
+    }
+  }
+
+  // Polled rather than watched. A file watch would have to keep the file loaded
+  // to notice it change, which is the read just bounded above, and it misses the
+  // case that matters most anyway: a file replaced by rename — what `sed -i`,
+  // most editors, and the worker's own set-config all do. Every write this
+  // plugin makes re-reads explicitly (see the Process handlers below), so the
+  // poll only has to catch a hand edit; applyConfigText reacts only when a value
+  // actually changed, so a poll that finds nothing new costs nothing.
   Timer {
     interval: 30000
     repeat: true
     running: true
-    onTriggered: configFile.reload()
+    onTriggered: root.reloadConfig()
   }
 
   // ------------------------------------------------------------------ status
@@ -200,7 +251,7 @@ Item {
       // Whatever the outcome, the images and the wallpaper may have moved — and
       // `enable`/`disable` rewrote config.env, so re-read it now rather than
       // waiting out the 30s poll.
-      configFile.reload()
+      root.reloadConfig()
       root.refreshStatus()
 
       if (exitCode === 0) {
@@ -251,7 +302,7 @@ Item {
       root.pendingConfigKey = ""
       // The worker rewrites the file; re-read it now rather than waiting out
       // the 30s poll, so the interval re-arms as soon as it is saved.
-      configFile.reload()
+      root.reloadConfig()
       root.refreshStatus()
       root.configApplied(key, exitCode === 0)
       if (exitCode !== 0)
@@ -351,7 +402,7 @@ Item {
 
   Component.onCompleted: {
     console.log("bg-pasticcio: service loaded, worker=" + root.workerPath)
-    configFile.reload()
+    root.reloadConfig()
     root.refreshStatus()
   }
 }

@@ -30,12 +30,24 @@
 
 set -uo pipefail
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bg-pasticcio"
+# Every path below is compared, sooner or later, against the background symlink
+# after `readlink -f` has resolved it, so the paths have to be resolved too.
+# With ~/.local/share (or $HOME) a symlink, an unresolved prefix matches
+# nothing: every image of ours reads as foreign, so nothing can be kept,
+# discard_unkept deletes the wallpaper on screen, and the background recorded
+# as "the one from before" is one of ours. -m rather than -f because none of
+# these exist yet on a first run.
+canonical_path() {
+  readlink -m -- "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+CONFIG_DIR=$(canonical_path "${XDG_CONFIG_HOME:-$HOME/.config}/bg-pasticcio")
 CONFIG_FILE="$CONFIG_DIR/config.env"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bg-pasticcio"
+CONFIG_LOCK="$CONFIG_DIR/.config-lock"
+DATA_DIR=$(canonical_path "${XDG_DATA_HOME:-$HOME/.local/share}/bg-pasticcio")
 IMAGE_DIR="$DATA_DIR/images"
 LIKED_DIR="$DATA_DIR/liked"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bg-pasticcio"
+STATE_DIR=$(canonical_path "${XDG_STATE_HOME:-$HOME/.local/state}/bg-pasticcio")
 LOG_FILE="$STATE_DIR/bg-pasticcio.log"
 LOCK_FILE="$STATE_DIR/lock"
 LAST_FILE="$STATE_DIR/last"
@@ -43,7 +55,7 @@ BLOCKLIST_FILE="$STATE_DIR/blocklist"
 NOTICE_IMAGE="$STATE_DIR/setup-required.png"
 ORIGINAL_FILE="$STATE_DIR/original-background"
 
-OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+OMARCHY_STATE=$(canonical_path "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy")
 CURRENT_LINK="$OMARCHY_STATE/current/background"
 
 # Works out of the box: a CC0 wallpaper feed that also sends title, creator and
@@ -55,8 +67,14 @@ LOG_KEEP_LINES=200
 
 # A wallpaper is a few megabytes; anything wildly larger is a mistake or a
 # hostile endpoint trying to fill the disk, and curl stops rather than storing
-# it. Applies to the JSON answer too, which should be a few hundred bytes.
+# it.
 MAX_DOWNLOAD_BYTES=$((64 * 1024 * 1024))
+
+# The JSON answer is a few hundred bytes and is read into a shell variable, so
+# it gets a cap of its own rather than the wallpaper's: at the image limit an
+# endpoint could drive this process to hundreds of megabytes before jq ever
+# looked at what it sent.
+MAX_JSON_BYTES=$((256 * 1024))
 
 # Redirects are followed by hand (see curl_with_backoff), so the ceiling is
 # ours to set rather than curl's.
@@ -69,6 +87,39 @@ REQUIRED_COMMANDS=(curl jq file sha256sum flock find getent)
 # Same extension set Omarchy itself accepts for backgrounds.
 FIND_EXT=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
   -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp')
+
+# --------------------------------------------------------------- temp files
+#
+# Every scratch file this worker writes carries its pid, so a run can clean up
+# after itself — none of them is an image, so discard_unkept cannot see them,
+# and a 64 MB half-download left behind stays there for good otherwise.
+
+cleanup_temp_files() {
+  rm -f -- \
+    "$IMAGE_DIR/.download.$$" \
+    "$STATE_DIR/.curl-body.$$" \
+    "$STATE_DIR/.curl-err.$$" \
+    "$CONFIG_DIR/.config.env.$$" \
+    "$LOG_FILE.tmp.$$" \
+    "$BLOCKLIST_FILE.tmp.$$" 2>/dev/null
+  return 0
+}
+
+# INT and TERM exit rather than resuming, which is what gets the EXIT trap run.
+trap cleanup_temp_files EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# A process killed outright — SIGKILL, a lost session, the power going — never
+# runs the trap above, so sweep what an earlier run left. An hour is far longer
+# than any transfer this worker waits for.
+sweep_stale_temp_files() {
+  find "$IMAGE_DIR" "$STATE_DIR" "$CONFIG_DIR" -maxdepth 1 -type f \
+    \( -name '.download.*' -o -name '.curl-body.*' -o -name '.curl-err.*' \
+    -o -name '.config.env.*' -o -name '*.tmp.*' \) \
+    -mmin +60 -delete 2>/dev/null
+  return 0
+}
 
 # ------------------------------------------------------------------ logging
 
@@ -664,13 +715,14 @@ resolve_pin_for() {
 # curl with bounded exponential backoff. $1 is where the body goes ("-" for
 # stdout), $2 the URL; a non-empty $3 says the URL is the one the user put in
 # config.env, which may legitimately be a private address — a local feed of
-# their own. Nothing the endpoint names afterwards gets that latitude.
+# their own. Nothing the endpoint names afterwards gets that latitude. $4 caps
+# the bytes accepted, defaulting to the wallpaper limit.
 #
 # -L is deliberately not used: it would connect to whatever the previous hop
 # named before url_is_public could look at it, so the hops are walked here.
 # Returns 6 for a hop that was refused, otherwise curl's own status.
 curl_with_backoff() {
-  local out=$1 url=$2 trusted=${3:-}
+  local out=$1 url=$2 trusted=${3:-} ceiling=${4:-$MAX_DOWNLOAD_BYTES}
   local attempt=1 hop target next rc delay reason
   local -a pin=()
   local errfile="$STATE_DIR/.curl-err.$$"
@@ -699,7 +751,7 @@ curl_with_backoff() {
       curl -fsS \
         --proto '=http,https' \
         ${pin[@]+"${pin[@]}"} \
-        --max-filesize "$MAX_DOWNLOAD_BYTES" \
+        --max-filesize "$ceiling" \
         --max-time "$BG_TIMEOUT_SECONDS" \
         -w '%{stderr}%{redirect_url}' \
         -o "$body" -- "$target" 2>"$errfile"
@@ -809,7 +861,7 @@ read_meta() {
 # command substitution, and a subshell cannot hand anything back any other way.
 resolve_endpoint_meta() {
   local body url meta
-  body=$(curl_with_backoff - "$BG_ENDPOINT" trusted) || return 1
+  body=$(curl_with_backoff - "$BG_ENDPOINT" trusted "$MAX_JSON_BYTES") || return 1
 
   url=$(printf '%s' "$body" | jq -er '.url' 2>/dev/null)
   if [[ -z $url || $url == "null" ]]; then
@@ -1055,6 +1107,12 @@ cmd_like() {
       ;;
   esac
 
+  # Before the move, not after: apply_background records the background it
+  # found, and by then the symlink points at a file that is no longer there —
+  # image_origin cannot recognise a path it cannot stat, so one of our own
+  # images would be written down as "the wallpaper from before".
+  remember_original_background
+
   local target="$LIKED_DIR/$(basename -- "$current")"
   mkdir -p "$LIKED_DIR" 2>/dev/null
   if ! mv -f -- "$current" "$target"; then
@@ -1198,6 +1256,21 @@ cmd_set_config() {
     return 1
   fi
 
+  # Still not the worker's lock — editing a setting must not queue behind a
+  # download — but the rewrite below reads the whole file and moves a new one
+  # over it, so two writers landing together throw one of the changes away.
+  # `enable` writing from inside the worker's lock and the panel writing an
+  # interval from outside it is exactly that case. Ordering is always this
+  # one's after the worker's, so the pair cannot deadlock.
+  exec 8>"$CONFIG_LOCK" || {
+    log "ERROR cannot open $CONFIG_LOCK"
+    return 1
+  }
+  if ! flock -w 5 8; then
+    log "ERROR another config write is in progress, not setting $key"
+    return 1
+  fi
+
   [[ -f $CONFIG_FILE ]] || write_default_config
 
   local tmp="$CONFIG_DIR/.config.env.$$" replaced=0 line
@@ -1313,6 +1386,10 @@ main() {
     log "another run is in progress, skipping"
     return 0
   fi
+
+  # Under the lock, so it runs once per real run rather than on every status
+  # poll, and never while another run's scratch files are live.
+  sweep_stale_temp_files
 
   local rc=0
   case "$command" in
