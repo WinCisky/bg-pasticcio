@@ -5,7 +5,7 @@
   "version": "1.3.0",
   "author": "ssimo",
   "license": "MIT",
-  "description": "Rotates the desktop background on a timer from a remote JSON endpoint, with an offline cache pool and a bar panel to rate what it shows you. Off until you switch it on, and it puts your original wallpaper back when you switch it off.",
+  "description": "Rotates the desktop background on a timer from a remote JSON endpoint, with a bar panel to keep or discard what it shows you. Falls back to the images you kept when the endpoint is unreachable. Off until you switch it on, and it puts your original wallpaper back when you switch it off.",
   "kinds": [
     "service",
     "bar-widget"
