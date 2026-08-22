@@ -3,20 +3,21 @@
 # bg-pasticcio — worker for the Omarchy background-rotation plugin.
 #
 # Fetches a JSON document from a configurable endpoint, downloads the image it
-# points at, applies it as the desktop background and keeps a small local pool
-# so rotation keeps working with no network.
+# points at and applies it as the desktop background. Nothing is cached: the
+# images the user kept are the only ones on disk, and the only thing to fall
+# back on when the endpoint cannot be reached.
 #
 # Usage: bg-pasticcio [run|next|like|dislike|enable|disable|restore|...]
 #
 #   run                   fetch a fresh image and apply it; falls back to `next`
-#   next                  rotate to the next image already on disk (no network)
-#   like                  keep the current image for good, safe from pruning
+#   next                  show the next image you kept (no network)
+#   like                  keep the current image for good
 #   dislike               never show the current image again, and replace it now
 #   enable                allow the plugin to change the background
 #   disable               stop it, and put the original background back
 #   restore               put the background from before the first change back
 #   set-config KEY VALUE  change one setting in config.env
-#   status                print JSON describing config, pool and last run
+#   status                print JSON describing config, images and last run
 #   interval              print the configured interval in minutes
 #
 # Nothing here touches the background until BG_ENABLED is turned on: the plugin
@@ -32,7 +33,7 @@ set -uo pipefail
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bg-pasticcio"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bg-pasticcio"
-POOL_DIR="$DATA_DIR/images"
+IMAGE_DIR="$DATA_DIR/images"
 LIKED_DIR="$DATA_DIR/liked"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bg-pasticcio"
 LOG_FILE="$STATE_DIR/bg-pasticcio.log"
@@ -46,7 +47,7 @@ OMARCHY_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 CURRENT_LINK="$OMARCHY_STATE/current/background"
 
 # Works out of the box: a CC0 wallpaper feed that also sends title, creator and
-# licence. Blank it in config.env to rotate only what is already downloaded.
+# licence. Blank it in config.env to rotate only the images you kept.
 DEFAULT_ENDPOINT="https://bg.ssimo.dev"
 
 LOG_MAX_BYTES=262144
@@ -111,7 +112,7 @@ BG_ENABLED=0
 
 # Endpoint returning JSON shaped like {"url": "https://.../image.jpg"}, and
 # optionally a title, creator and licence for it.
-# Leave empty to rotate only the images already downloaded.
+# Leave empty to rotate only the images you kept.
 EOF
   printf 'BG_ENDPOINT="%s"\n' "$DEFAULT_ENDPOINT" >>"$CONFIG_FILE"
   cat >>"$CONFIG_FILE" <<'EOF'
@@ -119,14 +120,10 @@ EOF
 # How often to change the background, in minutes.
 BG_INTERVAL_MINUTES=60
 
-# How many downloaded images to keep locally for offline rotation.
-# Liked images live outside the pool and are never counted or pruned.
-BG_KEEP_IMAGES=10
-
 # Per-request network timeout, in seconds.
 BG_TIMEOUT_SECONDS=20
 
-# Attempts per network call before giving up and rotating the local pool.
+# Attempts per network call before giving up and showing a kept image instead.
 BG_MAX_RETRIES=4
 
 # Exponential backoff base: waits BASE, BASE*2, BASE*4 ... between attempts.
@@ -134,16 +131,16 @@ BG_RETRY_BASE_SECONDS=2
 
 # How many times to ask the endpoint again when it answers with an image you
 # have already disliked. An endpoint that caches its answer will keep handing
-# back the same one, so this gives up quickly and rotates the pool instead.
+# back the same one, so this gives up quickly and shows a kept image instead.
 BG_BLOCKED_RETRIES=3
 EOF
 }
 
-CONFIG_KEYS=(BG_ENABLED BG_ENDPOINT BG_INTERVAL_MINUTES BG_KEEP_IMAGES
+CONFIG_KEYS=(BG_ENABLED BG_ENDPOINT BG_INTERVAL_MINUTES
   BG_TIMEOUT_SECONDS BG_MAX_RETRIES BG_RETRY_BASE_SECONDS BG_BLOCKED_RETRIES)
 
 load_config() {
-  mkdir -p "$CONFIG_DIR" "$POOL_DIR" "$LIKED_DIR" "$STATE_DIR" 2>/dev/null
+  mkdir -p "$CONFIG_DIR" "$IMAGE_DIR" "$LIKED_DIR" "$STATE_DIR" 2>/dev/null
 
   # Anything already in the environment wins over the config file, which makes
   # `BG_ENDPOINT=... bg-pasticcio run` usable for testing without editing config.
@@ -156,7 +153,6 @@ load_config() {
   BG_ENABLED=0
   BG_ENDPOINT="$DEFAULT_ENDPOINT"
   BG_INTERVAL_MINUTES=60
-  BG_KEEP_IMAGES=10
   BG_TIMEOUT_SECONDS=20
   BG_MAX_RETRIES=4
   BG_RETRY_BASE_SECONDS=2
@@ -183,7 +179,6 @@ load_config() {
 
   # A malformed number must not turn into an infinite loop or a zero interval.
   is_positive_int "$BG_INTERVAL_MINUTES" || BG_INTERVAL_MINUTES=60
-  is_positive_int "$BG_KEEP_IMAGES" || BG_KEEP_IMAGES=10
   is_positive_int "$BG_TIMEOUT_SECONDS" || BG_TIMEOUT_SECONDS=20
   is_positive_int "$BG_MAX_RETRIES" || BG_MAX_RETRIES=4
   is_positive_int "$BG_RETRY_BASE_SECONDS" || BG_RETRY_BASE_SECONDS=2
@@ -243,24 +238,19 @@ config_value_valid() {
   esac
 }
 
-# -------------------------------------------------------------------- pool
+# ------------------------------------------------------------------ images
 #
-# Two collections, one rotation. $POOL_DIR is the churn: downloaded images that
-# prune_pool trims back to BG_KEEP_IMAGES. $LIKED_DIR is what the user asked to
-# keep, so nothing in this file ever deletes from it. Both are rotated through.
+# There is no cache. $IMAGE_DIR holds at most one file — the downloaded image
+# currently on screen — and discard_unkept below is what keeps it at one.
+# $LIKED_DIR is the only collection that survives a run: nothing in this file
+# ever deletes from it, and it is the whole of what a failed fetch falls back
+# on.
 
 files_in() {
   find "$@" -maxdepth 1 -type f \( "${FIND_EXT[@]}" \) -print0 2>/dev/null | sort -z
 }
 
-pool_files_sorted() { files_in "$POOL_DIR"; }
 liked_files_sorted() { files_in "$LIKED_DIR"; }
-rotation_files_sorted() { files_in "$POOL_DIR" "$LIKED_DIR"; }
-
-pool_files_by_mtime() {
-  find "$POOL_DIR" -maxdepth 1 -type f \( "${FIND_EXT[@]}" \) -printf '%T@\t%p\0' 2>/dev/null |
-    sort -z -rn | cut -z -f2-
-}
 
 count_files() {
   local -a files
@@ -272,14 +262,14 @@ current_background() {
   readlink -f "$CURRENT_LINK" 2>/dev/null
 }
 
-# Where an image sits decides what the panel may offer for it: "pool" can be
-# liked, "liked" can only be disliked, anything else is not ours to judge.
+# Where an image sits decides what the panel may offer for it: "downloaded" can
+# be liked, "liked" can only be disliked, anything else is not ours to judge.
 image_origin() {
   local image=${1:-}
   [[ -n $image && -f $image ]] || return 1
   case "$image" in
     "$LIKED_DIR"/*) printf 'liked\n' ;;
-    "$POOL_DIR"/*) printf 'pool\n' ;;
+    "$IMAGE_DIR"/*) printf 'downloaded\n' ;;
     *) printf 'foreign\n' ;;
   esac
 }
@@ -316,10 +306,10 @@ remember_original_background() {
   resolved=$(readlink -f -- "$CURRENT_LINK" 2>/dev/null)
   target=$(readlink -- "$CURRENT_LINK" 2>/dev/null)
 
-  # Never record one of ours: a pool image, a kept one, or our own notice.
+  # Never record one of ours: a downloaded image, a kept one, or our own notice.
   if [[ -n $resolved ]]; then
     origin=$(image_origin "$resolved") || origin="none"
-    if [[ $origin == pool || $origin == liked || $resolved == "$NOTICE_IMAGE" ]]; then
+    if [[ $origin == downloaded || $origin == liked || $resolved == "$NOTICE_IMAGE" ]]; then
       resolved=""
       target=""
     fi
@@ -365,21 +355,24 @@ apply_background() {
   return 0
 }
 
-# Rotate to the next image after the one currently in use, wrapping around.
+# Rotate to the next kept image after the one currently in use, wrapping
+# around. This is the whole offline story: with $LIKED_DIR empty there is
+# nothing to fall back on, and the background is left exactly as it is.
+#
 # The optional argument is a path to leave out, which is how a dislike avoids
 # rotating straight back onto the image it is in the middle of removing.
-rotate_pool() {
+rotate_liked() {
   local exclude=${1:-}
   local -a images=()
   local file
   while IFS= read -r -d '' file; do
     [[ -n $exclude && $file == "$exclude" ]] && continue
     images+=("$file")
-  done < <(rotation_files_sorted)
+  done < <(liked_files_sorted)
 
   local total=${#images[@]}
   if ((total == 0)); then
-    log "nothing left to rotate to, leaving the background untouched"
+    log "no kept images to fall back on, leaving the background untouched"
     return 1
   fi
 
@@ -399,7 +392,7 @@ rotate_pool() {
 # --------------------------------------------------------------- ratings
 #
 # A dislike has to outlive the file it is about, so the blocklist keys on the
-# content hash (and the URL, when we know it) rather than on the path. Pool
+# content hash (and the URL, when we know it) rather than on the path. Image
 # file names only carry the first 8 hex digits; these rows carry all of it.
 
 image_hash() {
@@ -447,7 +440,7 @@ blocked_count() {
 #
 # With nothing to show there is nothing to show, and a silent no-op looks like
 # a broken plugin. Put the explanation on the wallpaper itself. The notice
-# lives outside both collections, so it is never rotated into and never pruned.
+# lives outside both directories, so it is never rotated into and never deleted.
 
 screen_geometry() {
   local geometry
@@ -522,7 +515,7 @@ EOF
 
 empty_notice_body() {
   cat <<'EOF'
-That image is gone and there is nothing else cached.
+That image is gone and you have not kept any others.
 
 The next scheduled run will fetch a new one, or open the
 bg-pasticcio panel in the bar and pick "Next" to
@@ -534,23 +527,20 @@ show_setup_notice() {
   show_notice "$(setup_notice_body)"
 }
 
-# Keep the newest BG_KEEP_IMAGES pool files, never deleting the one on screen.
-# $LIKED_DIR is not scanned here at all: liking an image is precisely the way
-# to take it out of this reckoning.
-prune_pool() {
-  local -a files
-  mapfile -d '' -t files < <(pool_files_by_mtime)
-  local current kept=0 file
+# Nothing downloaded is worth keeping unless the user said so, and the one on
+# screen is the single exception — deleting it would leave the desktop pointing
+# at a file that is gone. $LIKED_DIR is not scanned here at all: liking an image
+# is precisely how it stops being subject to this.
+#
+# Called once from main() after every command that takes the lock, so the
+# invariant — at most one file in $IMAGE_DIR — holds whatever the command did.
+discard_unkept() {
+  local current file
   current=$(current_background)
-
-  for file in "${files[@]}"; do
-    if ((kept < BG_KEEP_IMAGES)); then
-      ((kept++))
-      continue
-    fi
+  while IFS= read -r -d '' file; do
     [[ $file == "$current" ]] && continue
-    rm -f -- "$file" "$file.src" "$file.meta" && log "pruned $(basename -- "$file")"
-  done
+    rm -f -- "$file" "$file.src" "$file.meta" && log "discarded $(basename -- "$file")"
+  done < <(files_in "$IMAGE_DIR")
 }
 
 # ----------------------------------------------------------------- network
@@ -693,12 +683,12 @@ extension_for_mime() {
   esac
 }
 
-# Downloads $1, validates it really is an image, and prints the pool path.
+# Downloads $1, validates it really is an image, and prints where it landed.
 # $2 is the endpoint's metadata for it, stored beside the file.
 # Returns 2 when the bytes turn out to be an image the user has disliked.
 download_image() {
   local url=$1 meta=${2:-}
-  local tmp="$POOL_DIR/.download.$$"
+  local tmp="$IMAGE_DIR/.download.$$"
   rm -f -- "$tmp"
 
   if ! curl_with_backoff -o "$tmp" -- "$url"; then
@@ -730,7 +720,7 @@ download_image() {
   fi
 
   # Checked before the dedupe branch below, so a disliked image is never
-  # touched back to life by an endpoint that keeps offering it.
+  # brought back to life by an endpoint that keeps offering it.
   if is_blocked_hash "$sum"; then
     log "endpoint offered a disliked image again (by content)"
     rm -f -- "$tmp"
@@ -739,14 +729,13 @@ download_image() {
 
   local short target liked
   short=${sum:0:8}
-  target="$POOL_DIR/$short.$ext"
+  target="$IMAGE_DIR/$short.$ext"
   liked="$LIKED_DIR/$short.$ext"
 
-  # An endpoint that repeats itself must not drop a second copy of a kept
-  # image into the churn pool, where pruning would eventually delete it and
-  # the panel would stop calling it kept.
+  # An endpoint that repeats itself must not drop a second copy of a kept image
+  # next to the kept one, where the panel would stop calling it kept and the
+  # next command would delete it as unkept churn.
   if [[ -f $liked ]]; then
-    touch -- "$liked"
     rm -f -- "$tmp"
     write_meta "$liked" "$url" "$meta"
     log "endpoint returned an image you had kept ($short.$ext)"
@@ -755,11 +744,9 @@ download_image() {
   fi
 
   if [[ -f $target ]]; then
-    # Already have this exact image; refresh its mtime so pruning treats it as
-    # recently seen instead of storing a byte-identical duplicate.
-    touch -- "$target"
+    # Byte-identical to what is already on screen; keep the file we have.
     rm -f -- "$tmp"
-    log "endpoint returned an image already in the pool ($short.$ext)"
+    log "endpoint returned the image already on screen ($short.$ext)"
   else
     mv -f -- "$tmp" "$target" || {
       log "ERROR could not store downloaded image"
@@ -829,17 +816,17 @@ cmd_run() {
   require_enabled || return 0
 
   if [[ -z $BG_ENDPOINT ]]; then
-    log "BG_ENDPOINT is not set in $CONFIG_FILE, rotating what is on disk"
-    if rotate_pool; then
-      record_result rotated "No endpoint set, rotating cached images"
+    log "BG_ENDPOINT is not set in $CONFIG_FILE, showing a kept image instead"
+    if rotate_liked; then
+      record_result rotated "No endpoint set, showing a kept image"
       return 0
     fi
-    # Nothing configured and nothing cached: say so on the background itself.
+    # Nothing configured and nothing kept: say so on the background itself.
     if show_setup_notice; then
       record_result unconfigured "Set an endpoint to start fetching images"
       return 0
     fi
-    record_result failed "No endpoint set and nothing cached"
+    record_result failed "No endpoint set and no kept images"
     return 1
   fi
 
@@ -847,38 +834,39 @@ cmd_run() {
   image=$(fetch_fresh_image)
   rc=$?
   if ((rc == 0)) && apply_background "$image"; then
-    prune_pool
     record_result fetched "Fetched a new image"
     return 0
   fi
 
   local reason="the endpoint could not be reached"
   ((rc == 2)) && reason="the endpoint only offered images you disliked"
-  log "falling back to what is on disk: $reason"
-  if rotate_pool; then
+  log "falling back to the images you kept: $reason"
+  if rotate_liked; then
     if ((rc == 2)); then
-      record_result rotated "Nothing new at the endpoint, rotating cached images"
+      record_result rotated "Nothing new at the endpoint, showing a kept image"
     else
-      record_result rotated "Endpoint unreachable, rotating cached images"
+      record_result rotated "Endpoint unreachable, showing a kept image"
     fi
     return 0
   fi
 
-  record_result failed "Could not fetch, and nothing is cached"
+  # Nothing to put in its place, so whatever is on screen stays there and the
+  # service's backoff tries again later.
+  record_result failed "Could not fetch, and you have not kept any images"
   return 1
 }
 
 cmd_next() {
   require_enabled || return 0
-  if rotate_pool; then
-    record_result rotated "Rotated to the next cached image"
+  if rotate_liked; then
+    record_result rotated "Showing the next image you kept"
     return 0
   fi
   if [[ -z $BG_ENDPOINT ]] && show_setup_notice; then
     record_result unconfigured "Set an endpoint to start fetching images"
     return 0
   fi
-  record_result failed "Nothing cached to rotate to"
+  record_result failed "You have not kept any images yet"
   return 1
 }
 
@@ -922,7 +910,7 @@ cmd_like() {
   fi
 
   log "liked $(basename -- "$target")"
-  record_result liked "Kept — it will not be pruned"
+  record_result liked "Kept — it stays on disk"
   return 0
 }
 
@@ -961,13 +949,12 @@ cmd_dislike() {
   fi
 
   if ((rc == 0)) && apply_background "$replacement"; then
-    prune_pool
     record_result disliked "Removed, and fetched a replacement"
-  elif rotate_pool "$current"; then
-    : "${message:=Removed, showing a cached image instead}"
+  elif rotate_liked "$current"; then
+    : "${message:=Removed, showing a kept image instead}"
     record_result disliked "$message"
   elif show_notice "$(empty_notice_body)"; then
-    record_result disliked "Removed — nothing else is cached"
+    record_result disliked "Removed — you have not kept any others"
   else
     # Nothing could take its place, so the image stays on screen. Leaving it
     # blocked would mean the blocklist lies about what is showing.
@@ -1096,15 +1083,12 @@ cmd_status() {
     --arg current "$current" \
     --arg origin "$origin" \
     --arg config "$CONFIG_FILE" \
-    --arg pool "$POOL_DIR" \
     --arg liked "$LIKED_DIR" \
     --arg lastResult "${last_result:-unknown}" \
     --arg lastMessage "${last_message:-}" \
     --arg lastLog "$(tail -n1 -- "$LOG_FILE" 2>/dev/null)" \
     --arg lastRun "${last_epoch:-}" \
     --argjson interval "$BG_INTERVAL_MINUTES" \
-    --argjson keep "$BG_KEEP_IMAGES" \
-    --argjson stored "$(count_files pool_files_sorted)" \
     --argjson likedImages "$(count_files liked_files_sorted)" \
     --argjson blocked "$(blocked_count)" \
     --arg original "$original" \
@@ -1113,13 +1097,11 @@ cmd_status() {
     '{
       endpoint: $endpoint,
       intervalMinutes: $interval,
-      keepImages: $keep,
-      storedImages: $stored,
       likedImages: $likedImages,
       blockedImages: $blocked,
       currentBackground: $current,
       currentOrigin: $origin,
-      currentIsOurs: ($origin == "pool" or $origin == "liked"),
+      currentIsOurs: ($origin == "downloaded" or $origin == "liked"),
       currentLiked: ($origin == "liked"),
       currentMeta: $meta,
       enabled: $enabled,
@@ -1130,7 +1112,6 @@ cmd_status() {
       lastLog: $lastLog,
       lastRun: (if $lastRun == "" then null else ($lastRun | tonumber) end),
       configFile: $config,
-      poolDir: $pool,
       likedDir: $liked
     }'
 }
@@ -1153,15 +1134,15 @@ main() {
       return 0
       ;;
     set-config)
-      # Touches config.env only, never the pool, so it must not queue behind a
-      # download that can take a minute.
+      # Touches config.env only, never the images, so it must not queue behind
+      # a download that can take a minute.
       cmd_set_config "${2:-}" "${3-}"
       return $?
       ;;
   esac
 
-  # Only the commands that touch the pool or the wallpaper need the lock: a timer tick and a
-  # manual IPC call must never race each other into it.
+  # Only the commands that touch the images or the wallpaper need the lock: a
+  # timer tick and a manual IPC call must never race each other into it.
   exec 9>"$LOCK_FILE" || {
     log "ERROR cannot open lock file $LOCK_FILE"
     return 1
@@ -1171,6 +1152,7 @@ main() {
     return 0
   fi
 
+  local rc=0
   case "$command" in
     run) cmd_run ;;
     next | rotate) cmd_next ;;
@@ -1185,6 +1167,14 @@ main() {
       return 2
       ;;
   esac
+  rc=$?
+
+  # Whatever just happened, $IMAGE_DIR is left holding at most the image on
+  # screen: one call site rather than one per subcommand, and it cannot be
+  # forgotten by a path that changed the wallpaper in an unusual way.
+  discard_unkept
+
+  return $rc
 }
 
 main "$@"

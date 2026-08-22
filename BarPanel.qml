@@ -293,7 +293,6 @@ Panel {
       // While a field owns the keys, the panel's own shortcuts must not eat
       // what is being typed into it.
       blocked: endpointField.activeFocus || intervalField.field.activeFocus
-               || keepField.field.activeFocus
 
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
@@ -542,7 +541,7 @@ Panel {
               text: root.liked ? "Kept" : "Keep"
               iconText: root.liked ? "󰋑" : "󰋕"
               tooltipText: root.liked
-                ? "Already kept — it will not be pruned"
+                ? "Already kept"
                 : "Keep this one for good (f)"
               enabled: root.rotationOn && root.ours && !root.liked && !root.busy
               opacity: enabled ? 1.0 : 0.4
@@ -657,7 +656,7 @@ Panel {
             Text {
               width: parent.width
               visible: root.endpointError === "" && !root.endpointSaved
-              text: "Answers with {\"url\": \"https://…/image.jpg\"}. Empty rotates what is already downloaded."
+              text: "Answers with {\"url\": \"https://…/image.jpg\"}. Empty rotates the images you kept."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -689,21 +688,6 @@ Panel {
               }
             }
 
-            NumberField {
-              id: keepField
-              label: "Keep (images)"
-              from: 1
-              to: 200
-              stepSize: 1
-              value: root.status.keepImages || 10
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fieldWidth: Style.space(120)
-              onModified: function (next) {
-                if (root.service && next !== root.status.keepImages)
-                  root.service.setConfig("BG_KEEP_IMAGES", String(next))
-              }
-            }
           }
 
           PanelSeparator { foreground: root.foreground }
@@ -716,8 +700,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: (root.status.storedImages || 0) + " cached · "
-                + (root.status.likedImages || 0) + " kept · "
+              text: (root.status.likedImages || 0) + " kept · "
                 + (root.status.blockedImages || 0) + " never again"
               color: root.dim
               font.family: root.fontFamily

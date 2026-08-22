@@ -96,7 +96,7 @@ Item {
 
   // ------------------------------------------------------------------ status
   //
-  // The full picture — pool counts, ratings, what is on screen — is whatever
+  // The full picture — kept images, ratings, what is on screen — is whatever
   // `bg-pasticcio status` last said. Panels read this rather than shelling out
   // themselves, so N monitors still means one process.
   property var workerStatus: ({})
@@ -197,7 +197,7 @@ Item {
   Process {
     id: worker
     onExited: function (exitCode) {
-      // Whatever the outcome, the pool and the wallpaper may have moved — and
+      // Whatever the outcome, the images and the wallpaper may have moved — and
       // `enable`/`disable` rewrote config.env, so re-read it now rather than
       // waiting out the 30s poll.
       configFile.reload()
@@ -227,7 +227,7 @@ Item {
   // ------------------------------------------------------------------ config writes
   //
   // Separate from the worker above: editing a setting must not queue behind a
-  // download that can take a minute, and `set-config` never touches the pool
+  // download that can take a minute, and `set-config` never touches the images
   // so it does not take the worker's lock either.
 
   signal configApplied(string key, bool ok)
