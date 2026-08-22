@@ -60,23 +60,6 @@ omarchy plugin add https://github.com/WinCisky/bg-pasticcio.git --enable --yes
 omarchy bar put ssimo.bg-pasticcio --after omarchy.clock
 ```
 
-From a local checkout (`omarchy plugin add` clones, and a filesystem path is a
-valid git URL):
-
-```sh
-git init && git add -A && git commit -m "init"
-omarchy plugin add "$PWD" --enable --yes
-omarchy bar put ssimo.bg-pasticcio --after omarchy.clock
-```
-
-Or fully manually:
-
-```sh
-cp -r . ~/.config/omarchy/plugins/ssimo.bg-pasticcio
-omarchy-shell shell rescanPlugins
-omarchy plugin enable ssimo.bg-pasticcio --after omarchy.clock
-```
-
 Nothing has changed yet — that is deliberate. Click the icon by the clock and
 turn on **Change my background**; the wallpaper changes within a second or two,
 using the default feed. The equivalent from a terminal:
@@ -87,44 +70,6 @@ omarchy-shell bgpasticcio enable
 
 To use your own feed, paste the URL into the endpoint field in the panel and
 press Enter.
-
-### Upgrading from 1.0.x
-
-1.0 was a headless service, so it is recorded in `plugins[]` in `shell.json`
-rather than in the bar layout, and enabling it again is a no-op. Move it across
-once:
-
-```sh
-omarchy plugin disable ssimo.bg-pasticcio
-omarchy plugin enable ssimo.bg-pasticcio --after omarchy.clock
-```
-
-### Upgrading from `omarchy-bkg-changer`
-
-The plugin was renamed, and with it the plugin id, the worker, the IPC target
-and every directory it owns. Nothing migrates automatically. Remove the old
-plugin first, since the two ids install side by side:
-
-```sh
-omarchy plugin remove ssimo.bkg-changer
-```
-
-Then, to keep your liked images, blocklist and settings, move them across
-before installing the new one:
-
-```sh
-mv ~/.config/omarchy-bkg-changer       ~/.config/bg-pasticcio
-mv ~/.local/share/omarchy-bkg-changer  ~/.local/share/bg-pasticcio
-mv ~/.local/state/omarchy-bkg-changer  ~/.local/state/bg-pasticcio
-mv ~/.local/state/bg-pasticcio/bkg-changer.log \
-   ~/.local/state/bg-pasticcio/bg-pasticcio.log
-```
-
-Skipping this loses nothing — the old directories stay where they are — but
-the plugin starts from an empty pool with default settings.
-
-The `bkg-changer-off` / `bg-pasticcio-off` pause flag is gone: the panel's
-**Change my background** toggle replaces it, and it starts off.
 
 ## The panel
 
