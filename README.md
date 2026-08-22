@@ -1,5 +1,8 @@
 # bg-pasticcio
 
+![demo image](demo.jpg)
+
+
 An Omarchy 4 ("Quattro") shell plugin that changes your desktop background on a
 timer, pulling images from an HTTP JSON endpoint. An icon next to the clock
 opens a panel to switch it on, point it at a feed, and keep or discard the
