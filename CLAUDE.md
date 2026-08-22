@@ -203,9 +203,12 @@ CGNAT and multicast addresses, so a feed cannot have this machine fetch from a
 service only this machine can reach. `-L` is not used — it would connect to
 whatever the previous hop named before that check could run — so
 `curl_with_backoff` walks redirects itself (at most `MAX_REDIRECTS`) and vets
-every hop. Only `BG_ENDPOINT` itself is exempt on its first hop, since the user
-configured it and a local feed of their own is legitimate; nothing it points at
-afterwards is.
+every hop. curl is then pinned to the addresses that passed, with `--resolve`
+built by `resolve_pin_for` from `RESOLVED_ADDRS`, so it never looks the name up
+a second time: a name whose owner controls the DNS answer cannot show a public
+address to the check and a loopback one to the fetch. Only `BG_ENDPOINT` itself
+is exempt on its first hop, since the user configured it and a local feed of
+their own is legitimate; nothing it points at afterwards is.
 
 ## Invariants — do not break these
 

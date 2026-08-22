@@ -585,17 +585,46 @@ url_host() {
   printf '%s' "${rest%%:*}"
 }
 
+# The port a URL connects on, so a pinned address is pinned to the right one.
+# Explicit port wins; otherwise the scheme's default.
+url_port() {
+  local url=$1 scheme rest port=""
+  scheme=${url%%://*}
+  rest=${url#*://}
+  rest=${rest%%/*}
+  rest=${rest%%\?*}
+  rest=${rest%%#*}
+  rest=${rest##*@}
+  if [[ $rest == \[*\]* ]]; then
+    port=${rest#*\]}
+  elif [[ $rest == *:* ]]; then
+    port=:${rest##*:}
+  fi
+  port=${port#:}
+  if [[ $port =~ ^[0-9]+$ ]]; then
+    printf '%s' "$port"
+  elif [[ ${scheme,,} == https ]]; then
+    printf '443'
+  else
+    printf '80'
+  fi
+}
+
 # The endpoint picks the image URL, and a redirect lets it pick again after the
 # first hop, so every address a hop resolves to has to be a public one.
 # Otherwise a feed could have this machine fetch from something only this
 # machine can reach — a service on loopback, a box on the LAN.
 #
-# The name is resolved here and then handed back to curl to resolve again, so a
-# DNS answer that changes between the two would still get through. Closing that
-# too would mean pinning the address curl connects to; the redirect this does
-# close is the part the endpoint controls outright.
+# Checking the name and then letting curl look it up again would leave a gap:
+# a name whose owner controls the DNS answer can hand out a public address here
+# and a loopback one to curl a moment later. So the addresses that passed are
+# kept in RESOLVED_ADDRS and curl is pinned to exactly those with --resolve —
+# what was vetted is what gets connected to, and no second lookup happens.
+RESOLVED_ADDRS=()
+
 url_is_public() {
-  local url=$1 host addr resolved=0
+  local url=$1 host addr
+  RESOLVED_ADDRS=()
   host=$(url_host "$url")
   if [[ -z $host ]]; then
     log "ERROR refusing a url with no host"
@@ -603,14 +632,33 @@ url_is_public() {
   fi
   while read -r addr _; do
     [[ -n $addr ]] || continue
-    resolved=1
     if ! is_public_address "$addr"; then
       log "ERROR refusing $host: it resolves to the non-public address $addr"
+      RESOLVED_ADDRS=()
       return 1
     fi
+    # getent lists an address once per socket type; curl wants each one once.
+    [[ " ${RESOLVED_ADDRS[*]} " == *" $addr "* ]] && continue
+    RESOLVED_ADDRS+=("$addr")
   done < <(getent ahosts "$host" 2>/dev/null)
-  ((resolved)) || { log "ERROR could not resolve $host"; return 1; }
+  ((${#RESOLVED_ADDRS[@]})) || { log "ERROR could not resolve $host"; return 1; }
   return 0
+}
+
+# The --resolve argument that pins a hop to the addresses just vetted for it.
+# Prints nothing when the host is already a literal address: there is no name
+# to resolve, so curl connects to the address is_public_address passed on.
+resolve_pin_for() {
+  local url=$1 host addr list=""
+  host=$(url_host "$url")
+  [[ $host == *:* || $host =~ ^[0-9.]+$ ]] && return 0
+  for addr in "${RESOLVED_ADDRS[@]}"; do
+    # A literal IPv6 address goes in brackets, the way curl expects it.
+    [[ $addr == *:* ]] && addr="[$addr]"
+    list+="${list:+,}$addr"
+  done
+  [[ -n $list ]] || return 0
+  printf -- '--resolve\n%s:%s:%s\n' "$host" "$(url_port "$url")" "$list"
 }
 
 # curl with bounded exponential backoff. $1 is where the body goes ("-" for
@@ -624,6 +672,7 @@ url_is_public() {
 curl_with_backoff() {
   local out=$1 url=$2 trusted=${3:-}
   local attempt=1 hop target next rc delay reason
+  local -a pin=()
   local errfile="$STATE_DIR/.curl-err.$$"
   local body=$out spool=""
   [[ $out == - ]] && {
@@ -635,9 +684,13 @@ curl_with_backoff() {
     hop=0
     target=$url
     while :; do
-      if [[ -z $trusted || $hop -gt 0 ]] && ! url_is_public "$target"; then
-        rm -f -- "$errfile" "$spool"
-        return 6
+      pin=()
+      if [[ -z $trusted || $hop -gt 0 ]]; then
+        if ! url_is_public "$target"; then
+          rm -f -- "$errfile" "$spool"
+          return 6
+        fi
+        mapfile -t pin < <(resolve_pin_for "$target")
       fi
       # Explicit protocols: an endpoint must not be able to send the fetch into
       # file:// or scp://, whatever the local curl's defaults happen to be.
@@ -645,6 +698,7 @@ curl_with_backoff() {
       # of the body; on a final response it writes nothing at all.
       curl -fsS \
         --proto '=http,https' \
+        ${pin[@]+"${pin[@]}"} \
         --max-filesize "$MAX_DOWNLOAD_BYTES" \
         --max-time "$BG_TIMEOUT_SECONDS" \
         -w '%{stderr}%{redirect_url}' \
