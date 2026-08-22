@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ssimo.bg-pasticcio",
   "name": "bg-pasticcio",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "author": "ssimo",
   "license": "MIT",
   "description": "Rotates the desktop background on a timer from a remote JSON endpoint, with a bar panel to keep or discard what it shows you. Falls back to the images you kept when the endpoint is unreachable. Off until you switch it on, and it puts your original wallpaper back when you switch it off.",

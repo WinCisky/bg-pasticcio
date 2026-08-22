@@ -1,6 +1,6 @@
 # bg-pasticcio
 
-![demo image](demo.jpg)
+![demo image](preview.jpg)
 
 
 An Omarchy 4 ("Quattro") shell plugin that changes your desktop background on a
